@@ -4,8 +4,6 @@
 
 **The warm code-context engine for AI coding agents.**
 
-*rhymes with "buyer" · Swedish for "views, vistas, visions"*
-
 [![npm](https://img.shields.io/npm/v/@0x1labs/vyer?color=cb3837&logo=npm&logoColor=white)](https://www.npmjs.com/package/@0x1labs/vyer)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](https://github.com/chirayuoli/vyer)
 [![GitHub](https://img.shields.io/badge/source-chirayuoli%2Fvyer-181717?logo=github)](https://github.com/chirayuoli/vyer)
@@ -20,26 +18,32 @@ matching prebuilt `vyer` binary for your platform on install.
 
 ## Use it
 
-```sh
-npx -y @0x1labs/vyer serve --root .      # run it, no install
-npm install -g @0x1labs/vyer             # or install the `vyer` command globally
-```
-
-Wire it into your agent host (Claude Code / Cursor / Windsurf / Cline):
+Vyer is an **MCP server** — your agent host launches it and talks to it over stdio. You don't run
+`vyer serve` by hand; you point your host (Claude Code / Cursor / Windsurf / Cline) at it:
 
 ```jsonc
+// .mcp.json (or your host's MCP config)
 {
   "mcpServers": {
-    "vyer": { "command": "npx", "args": ["-y", "@0x1labs/vyer", "serve", "--root", ".", "--watch"] }
+    "vyer": { "command": "npx", "args": ["-y", "@0x1labs/vyer", "serve", "--root", ".", "--watch", "--allow-writes"] }
   }
 }
 ```
 
-Add `--allow-writes` to let it edit. Then point your agent at it with one command:
+Claude Code one-liner:
 
 ```sh
-vyer init      # drops a managed note into ./CLAUDE.md so the agent prefers Vyer (idempotent)
+claude mcp add vyer -- npx -y @0x1labs/vyer serve --root . --watch --allow-writes
 ```
+
+`--allow-writes` lets Vyer edit (drop it for read-only). Then tell your agent to prefer it:
+
+```sh
+npx -y @0x1labs/vyer init      # drops a managed note into ./CLAUDE.md (idempotent)
+```
+
+Want a global `vyer` command? `npm install -g @0x1labs/vyer`. To check it from a terminal (no agent),
+use `vyer version` or `vyer query "<search>"` — `serve` only does something when an agent drives it.
 
 ## What you get
 

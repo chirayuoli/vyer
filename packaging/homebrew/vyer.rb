@@ -11,7 +11,7 @@
 class Vyer < Formula
   desc "Warm, local-first code-context engine for AI coding agents (MCP server)"
   homepage "https://github.com/chirayuoli/vyer"
-  version "0.1.1"
+  version "0.1.2"
   license any_of: ["MIT", "Apache-2.0"]
 
   on_macos do

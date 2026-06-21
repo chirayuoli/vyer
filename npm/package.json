@@ -1,16 +1,46 @@
 {
   "name": "@0x1labs/vyer",
-  "version": "0.1.1",
-  "publishConfig": { "access": "public" },
+  "version": "0.1.2",
+  "publishConfig": {
+    "access": "public"
+  },
   "description": "Vyer — the warm code-context engine for AI coding agents (MCP server).",
-  "keywords": ["mcp", "ai", "agent", "code-search", "code-context", "llm", "claude", "cursor"],
+  "keywords": [
+    "mcp",
+    "ai",
+    "agent",
+    "code-search",
+    "code-context",
+    "llm",
+    "claude",
+    "cursor"
+  ],
   "homepage": "https://github.com/chirayuoli/vyer",
-  "repository": { "type": "git", "url": "github:chirayuoli/vyer" },
+  "repository": {
+    "type": "git",
+    "url": "github:chirayuoli/vyer"
+  },
   "license": "(MIT OR Apache-2.0)",
-  "bin": { "vyer": "bin/vyer.js" },
-  "scripts": { "postinstall": "node install.js" },
-  "files": ["bin/vyer.js", "install.js"],
-  "engines": { "node": ">=16" },
-  "os": ["darwin", "linux", "win32"],
-  "cpu": ["x64", "arm64"]
+  "bin": {
+    "vyer": "bin/vyer.js"
+  },
+  "scripts": {
+    "postinstall": "node install.js"
+  },
+  "files": [
+    "bin/vyer.js",
+    "install.js"
+  ],
+  "engines": {
+    "node": ">=16"
+  },
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ]
 }

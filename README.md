@@ -4,8 +4,6 @@
 
 **The warm code-context engine for AI coding agents.**
 
-*Vyer · rhymes with "buyer" · Swedish for "views, vistas, visions"*
-
 One MCP tool that gives your agent fast, structure-aware sight into a codebase — and a safe,
 precise way to change it. Warm, resident, always fresh. Fully local.
 
@@ -115,10 +113,13 @@ change — done fast, safe, and local:
 
 | Channel | Command |
 |---|---|
-| **npm** (just needs Node) | `npx -y @0x1labs/vyer serve --root .` |
+| **npm** (just needs Node) | `npm install -g @0x1labs/vyer` |
 | **Homebrew** | `brew install chirayuoli/tap/vyer` |
 | **Prebuilt binary** | grab it from [Releases](https://github.com/chirayuoli/vyer/releases) (macOS / Linux / Windows) |
 | **From source** | `cargo install --git https://github.com/chirayuoli/vyer vyer-server` |
+
+> You don't run `vyer serve` by hand — it's an MCP server your agent host launches (step 2). With the
+> npm config below you don't even need to install anything; `npx` fetches it on demand.
 
 **2. Point your agent at it.** Vyer auto-indexes the current repo and talks over stdio — no network,
 nothing to configure:
@@ -127,13 +128,14 @@ nothing to configure:
 // Claude Code / Cursor / Windsurf  ->  .mcp.json (or your host's MCP config)
 {
   "mcpServers": {
-    "vyer": { "command": "npx", "args": ["-y", "@0x1labs/vyer", "serve", "--root", ".", "--watch"] }
+    "vyer": { "command": "npx", "args": ["-y", "@0x1labs/vyer", "serve", "--root", ".", "--watch", "--allow-writes"] }
   }
 }
 ```
 
-Add `--allow-writes` to let it edit. On Claude Code you can skip the JSON:
-`claude mcp add vyer -- npx -y @0x1labs/vyer serve --root . --watch`.
+`--allow-writes` lets Vyer edit (the point is find *and* fix) — drop it for read-only. On Claude Code
+you can skip the JSON:
+`claude mcp add vyer -- npx -y @0x1labs/vyer serve --root . --watch --allow-writes`.
 
 **3. Tell your agent to actually use it.** One command drops a short, managed note into your `CLAUDE.md`
 so the agent reaches for Vyer (and works in batches) instead of native tools:

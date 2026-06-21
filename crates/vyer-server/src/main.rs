@@ -225,6 +225,29 @@ fn cmd_init(args: &[String]) -> Result<(), String> {
 }
 
 fn cmd_serve(args: &[String]) -> Result<(), String> {
+    // A bare `vyer serve` in an interactive terminal has no MCP client to send the
+    // handshake, so the stdio server would just fail on an empty stdin with a cryptic
+    // "connection closed" error. Detect that case (stdio mode + a TTY stdin) and guide
+    // the user instead of failing. A real agent host pipes stdin (not a TTY), so this
+    // never triggers when launched properly.
+    if flag(args, "--http").is_none() && std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        eprintln!(
+            "vyer serve is an MCP server — it speaks the Model Context Protocol over stdio and is\n\
+             meant to be launched by your AGENT HOST, not run directly in a terminal.\n\
+             \n\
+             Add it to your host's MCP config, e.g. Claude Code:\n\
+             \x20 claude mcp add vyer -- npx -y @0x1labs/vyer serve --root . --watch --allow-writes\n\
+             \n\
+             …or in .mcp.json (Cursor / Windsurf / Claude Code):\n\
+             \x20 {{ \"mcpServers\": {{ \"vyer\": {{ \"command\": \"vyer\", \"args\": [\"serve\", \"--root\", \".\", \"--allow-writes\"] }} }} }}\n\
+             \n\
+             To try it from the CLI without an agent, use a one-shot command instead of `serve`:\n\
+             \x20 vyer query \"<search>\"      vyer version\n\
+             \n\
+             Docs: https://github.com/chirayuoli/vyer"
+        );
+        return Ok(());
+    }
     let engine = Arc::new(build_engine(args)?);
     eprintln!(
         "vyer: indexed {} files (writes {})",
