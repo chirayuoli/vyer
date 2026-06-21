@@ -109,7 +109,7 @@ impl ServerHandler for VyerService {
                  new_body replaces a symbol's node; anchor/replace for a sub-symbol or \
                  module-level edit (add word:true to safely rename a local var within ONE \
                  symbol's body); rename (repo-wide, symbol-aware); move_to; \
-                 @after:sym/@before:sym/@end insert relative to a symbol; @new creates a NEW \
+                 @after:sym/@before:sym insert relative to a symbol; @end appends at end of file; @new creates a NEW \
                  FILE (locator PATH#@new, body = the file contents; refused if PATH exists); \
                  @into:CONTAINER to add a member \
                  inside a class/impl/struct; @delete to remove a symbol; undo:N to roll back. \

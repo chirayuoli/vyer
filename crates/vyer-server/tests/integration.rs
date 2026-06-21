@@ -423,6 +423,26 @@ fn rename_is_confined_to_the_symbols_language() {
 }
 
 #[test]
+fn end_directive_with_symbol_is_rejected_with_guidance() {
+    // NEW-E: `@end:SYMBOL` is rejected with a hint pointing at @into/@after, not a
+    // bare "unknown directive" (the playbook listed @end under "relative to a symbol").
+    let (_d, root) = fixture();
+    let eng = engine(&root, true);
+    let err = eng
+        .code_apply(&one_edit(
+            "src/auth/token.rs#@end:validate_token",
+            None,
+            None,
+            Some("fn x() {}"),
+        ))
+        .unwrap_err();
+    assert!(
+        err.contains("@into:validate_token") || err.contains("@after:validate_token"),
+        "@end:SYMBOL should point to @into/@after: {err}"
+    );
+}
+
+#[test]
 fn apply_delete_file_removes_it() {
     let (_d, root) = fixture();
     let eng = engine(&root, true);

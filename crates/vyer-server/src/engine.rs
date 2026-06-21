@@ -454,6 +454,9 @@ impl Engine {
         // so the envelope can tell the agent its param was ignored (not honored).
         let mut unknown_mode: Option<String> = None;
         let mut unknown_detail: Option<String> = None;
+        // SCRY-124 (#4): an unrecognized `lang` filters to 0 files silently; remember
+        // it so the envelope warns instead of returning a bare empty result.
+        let mut unknown_lang: Option<String> = None;
         // SCRY-024: per-query attribution. We record `spans.len()` at the start of
         // each query iteration (and once more after the loop); the delta between
         // consecutive marks is that query's hit count. Lets a batched caller see
@@ -474,6 +477,11 @@ impl Engine {
         for query in &req.queries {
             summary_q.push(format!("{}({}/{})", query.q, query.mode, query.detail));
             marks.push(spans.len());
+            if let Some(l) = &query.lang {
+                if !l.trim().is_empty() && lang_extensions(l).is_empty() {
+                    unknown_lang = Some(l.clone());
+                }
+            }
 
             // SUPERPOWER (SCRY-116): `mode=diagnose` — paste a compiler/test/stack-trace blob into
             // `q` → the exact code it references (enclosing symbol + a window with the failing line
@@ -728,7 +736,16 @@ impl Engine {
         // No hits anywhere → an actionable error envelope, not an empty result.
         if spans.is_empty() {
             self.record("code", format!("queries=[{}] hits=0", summary_q.join(", ")));
-            return output::format_error("PATTERN_NO_MATCH", &no_match_hint(&req.queries));
+            let mut err = output::format_error("PATTERN_NO_MATCH", &no_match_hint(&req.queries));
+            // SCRY-124 (#4): an unknown `lang` filter is the likely cause of an empty
+            // result — surface it here too (the envelope notes below are skipped on
+            // the no-match path).
+            if let Some(l) = &unknown_lang {
+                err.push_str(&output::note_line(&format!(
+                    "unknown lang `{l}` — filter matched 0 files; known: rust|python|js|ts|go|dart|java|ruby|swift|kotlin|c|cpp|cs|php|yaml|json|toml|md|html|css|sh|xml (comma-separated ok)"
+                )));
+            }
+            return err;
         }
 
         let total = spans.len();
@@ -756,6 +773,11 @@ impl Engine {
                 "unknown detail `{d}` — used `snippet`; valid: locate|outline|snippet|full|refs|impact|context|count|tree|diff|ast"
             )));
         }
+        if let Some(l) = &unknown_lang {
+            envelope.push_str(&output::note_line(&format!(
+                "unknown lang `{l}` — filter matched 0 files; known: rust|python|js|ts|go|dart|java|ruby|swift|kotlin|c|cpp|cs|php|yaml|json|toml|md|html|css|sh|xml (comma-separated ok)"
+            )));
+        }
         // SCRY-024: when more than one query is batched, attribute how many spans
         // each found so the agent can tell which matched and re-issue the empties.
         if req.queries.len() >= 2 && marks.len() == req.queries.len() + 1 {
@@ -767,8 +789,24 @@ impl Engine {
                     let hits = marks[i + 1].saturating_sub(marks[i]);
                     let label = if !q.q.is_empty() {
                         q.q.clone()
+                    } else if let Some(p) = &q.path {
+                        p.clone()
+                    } else if has_bool(q) {
+                        // SCRY-124 (NEW-D): label a boolean query by its TERMS, not
+                        // its detail value.
+                        let mut parts = Vec::new();
+                        if !q.all_of.is_empty() {
+                            parts.push(format!("all[{}]", q.all_of.join(",")));
+                        }
+                        if !q.any_of.is_empty() {
+                            parts.push(format!("any[{}]", q.any_of.join(",")));
+                        }
+                        if !q.none_of.is_empty() {
+                            parts.push(format!("not[{}]", q.none_of.join(",")));
+                        }
+                        parts.join(" ")
                     } else {
-                        q.path.clone().unwrap_or_else(|| q.detail.clone())
+                        q.detail.clone()
                     };
                     format!("q{i} `{label}`→{hits}")
                 })
@@ -2226,12 +2264,29 @@ impl Engine {
             if !path_in_scope(path, &q.path_scope) {
                 continue;
             }
-            let old = orig.clone().unwrap_or_default();
             let new: String = db.text(path).map(|t| t.to_string()).unwrap_or_default();
+            // SCRY-123 (#7): a file CREATED this session has no session-start text,
+            // so a unified diff renders its WHOLE content as `+` lines — turning
+            // detail=diff into a full-repo dump. Summarize instead; the content is
+            // readable via `path`. Real deltas are still shown for MODIFIED files.
+            if orig.is_none() {
+                let added = new.lines().count();
+                spans.push(budget::Span {
+                    id: format!("{path}#diff"),
+                    text: format!(
+                        "{path}: created NEW file (+{added} lines) — read it with code {{ path:\"{path}\" }}"
+                    ),
+                    score: 1.0,
+                });
+                continue;
+            }
+            let old = orig.clone().unwrap_or_default();
             if old == new {
                 continue; // net-zero: edited then reverted/undone this session
             }
-            let body = apply::line_diff(path, &old, &new);
+            // A modified file: the real delta, capped so one huge change can't
+            // dominate the budget (SCRY-123).
+            let body = cap_diff(&apply::line_diff(path, &old, &new), 160);
             spans.push(budget::Span {
                 id: format!("{path}#diff"),
                 text: format_diff(&body, path),
@@ -3213,6 +3268,14 @@ impl Engine {
                     )
                     .map_err(mkerr)?
                 } else if let Some(s) = &sym {
+                    if let Some(sym_after) = s.strip_prefix("@end:") {
+                        // NEW-E: `@end` appends at end of FILE and takes no symbol;
+                        // `@end:SYMBOL` is the common mistake. Point to the ops that
+                        // DO take a symbol rather than a bare "unknown directive".
+                        return Err(format!(
+                            "`@end` takes no symbol (it appends at the end of the FILE). To add at the end of a container use `{path}#@into:{sym_after}`; for a sibling right after it use `{path}#@after:{sym_after}`."
+                        ));
+                    }
                     if s.starts_with('@') {
                         return Err(format!("unknown directive `#{s}` (use @after:/@before:/@into:/@end/@delete:/@new, or a symbol name)"));
                     }
@@ -3554,6 +3617,45 @@ impl Engine {
             if !targets.is_empty() {
                 found = true;
                 out.push_str(&format!("make: {}\n", targets.join(" \u{b7} ")));
+            }
+        }
+
+        // SCRY-125 (#5): monorepos keep manifests in service SUBDIRS, not the root.
+        // Surface them from the indexed file set so `vyer://project` isn't empty.
+        {
+            const MANIFESTS: &[&str] = &[
+                "Cargo.toml",
+                "package.json",
+                "go.mod",
+                "build.gradle",
+                "build.gradle.kts",
+                "pom.xml",
+                "pubspec.yaml",
+                "pyproject.toml",
+                "setup.py",
+                "setup.cfg",
+                "requirements.txt",
+                "Gemfile",
+            ];
+            let db = self.db.lock().unwrap();
+            let mut subs: Vec<String> = db
+                .files()
+                .into_iter()
+                .filter(|f| {
+                    f.contains('/') && MANIFESTS.iter().any(|m| f.rsplit('/').next() == Some(*m))
+                })
+                .collect();
+            subs.sort();
+            subs.dedup();
+            if !subs.is_empty() {
+                found = true;
+                out.push_str("monorepo packages (manifests in subdirectories):\n");
+                for f in subs.iter().take(40) {
+                    out.push_str(&format!("  {}\n", output::sanitize_field(f)));
+                }
+                if subs.len() > 40 {
+                    out.push_str(&format!("  … +{} more\n", subs.len() - 40));
+                }
             }
         }
 
@@ -5041,6 +5143,17 @@ fn lang_exts_one(lang: &str) -> Vec<&'static str> {
         "cpp" | "c++" => vec![".cpp", ".cc", ".cxx", ".hpp", ".h", ".hh", ".hxx"],
         "cs" | "csharp" => vec![".cs"],
         "php" => vec![".php"],
+        // SCRY-124 (#4): common non-tree-sitter text formats are still worth
+        // FILTERING by extension (search/tree/count), even without a parser.
+        "yaml" | "yml" => vec![".yaml", ".yml"],
+        "json" => vec![".json"],
+        "toml" => vec![".toml"],
+        "dockerfile" | "docker" => vec![".dockerfile", "Dockerfile"],
+        "md" | "markdown" => vec![".md", ".markdown"],
+        "html" => vec![".html", ".htm"],
+        "css" => vec![".css"],
+        "sh" | "bash" | "shell" => vec![".sh", ".bash"],
+        "xml" => vec![".xml"],
         _ => vec![],
     }
 }
@@ -5284,6 +5397,20 @@ fn is_generated(path: &str) -> bool {
         // codegen too — tag + demote them like the suffix-based artifacts.
         || p.split('/')
             .any(|seg| seg == "generated" || seg == "__generated__")
+}
+
+/// SCRY-123: cap a unified-diff body so one large change can't dominate the
+/// output budget. Keeps the first `max_lines` lines + a one-line remainder note.
+fn cap_diff(diff: &str, max_lines: usize) -> String {
+    let total = diff.lines().count();
+    if total <= max_lines {
+        return diff.to_string();
+    }
+    let head: String = diff.lines().take(max_lines).collect::<Vec<_>>().join("\n");
+    format!(
+        "{head}\n… +{} more diff lines (read the file or narrow with q=path)",
+        total - max_lines
+    )
 }
 
 /// Short content hash for staleness detection in the locator. (blake3 in the
@@ -5993,6 +6120,27 @@ mod tests {
     }
 
     #[test]
+    fn project_info_discovers_subdir_manifests() {
+        // SCRY-125 (#5): a monorepo keeps manifests in service subdirs; project_info
+        // must surface them, not report "no build manifest".
+        let engine = engine_with(&[
+            ("services/api/go.mod", "module api\n"),
+            ("apps/web/package.json", "{}\n"),
+            ("src/main.rs", "fn main() {}\n"),
+        ]);
+        let info = engine.project_info();
+        assert!(
+            info.contains("monorepo packages"),
+            "should list subdir manifests: {info}"
+        );
+        assert!(info.contains("services/api/go.mod"), "go.mod: {info}");
+        assert!(
+            info.contains("apps/web/package.json"),
+            "package.json: {info}"
+        );
+    }
+
+    #[test]
     fn import_resolves_symbol_and_builds_statement() {
         let engine = engine_with(&[
             ("src/models/user.ts", "export class User {}\n"),
@@ -6129,6 +6277,30 @@ mod tests {
     }
 
     #[test]
+    fn diff_summarizes_created_files() {
+        // SCRY-123 (#7): a file CREATED this session is summarized in detail=diff,
+        // not dumped as a full +file (which turned diff into a repo dump).
+        let engine = engine_with(&[("keep.rs", "fn keep() {}\n")]);
+        engine
+            .history
+            .lock()
+            .unwrap()
+            .push(vec![("new.rs".to_string(), None)]);
+        engine
+            .db
+            .lock()
+            .unwrap()
+            .set_text("new.rs", "fn a() {}\nfn b() {}\nfn c() {}\n");
+        let db = engine.db.lock().unwrap();
+        let d = &engine.diff_spans(&db, &base_query())[0].text;
+        assert!(
+            d.contains("created NEW file (+3 lines)"),
+            "should summarize created file: {d}"
+        );
+        assert!(!d.contains("fn b()"), "must not dump the file body: {d}");
+    }
+
+    #[test]
     fn batch_queries_report_per_query_attribution() {
         let engine = engine_with(&[("src/a.rs", "fn alpha() {}\nfn beta() {}\n")]);
         let req = CodeRequest {
@@ -6174,6 +6346,36 @@ mod tests {
         assert!(
             !engine.code(&single).contains("per-query found:"),
             "single query should not be attributed"
+        );
+    }
+
+    #[test]
+    fn boolean_query_attribution_labels_by_terms() {
+        // NEW-D / SCRY-124: a boolean query is labeled by its TERMS in the per-query
+        // found note, not by its detail value.
+        let engine = engine_with(&[("a.rs", "fn alpha() {}\nfn beta() {}\n")]);
+        let req = CodeRequest {
+            queries: vec![
+                Query {
+                    q: "alpha".into(),
+                    mode: "lexical".into(),
+                    detail: "locate".into(),
+                    ..base_query()
+                },
+                Query {
+                    all_of: vec!["fn".into(), "beta".into()],
+                    detail: "count".into(),
+                    ..base_query()
+                },
+            ],
+            budget_tokens: 8000,
+            exclude_seen: false,
+        };
+        let out = engine.code(&req);
+        assert!(out.contains("per-query found:"), "no attribution: {out}");
+        assert!(
+            out.contains("q1 `all[fn,beta]`"),
+            "boolean query must be labeled by its terms: {out}"
         );
     }
 
@@ -7290,6 +7492,48 @@ mod tests {
             "ts,js should include both: {both}"
         );
         assert!(!both.contains("c.py"), "py should stay excluded: {both}");
+    }
+
+    #[test]
+    fn lang_filter_supports_text_formats_and_warns_on_unknown() {
+        // SCRY-124 (#4): yaml/json/etc are extension-filterable; a truly unknown lang
+        // warns instead of silently returning nothing.
+        let engine = engine_with(&[
+            ("config/app.yaml", "channels:\n  - email\n"),
+            ("src/a.rs", "fn channels() {}\n"),
+        ]);
+        let y = engine.code(&CodeRequest {
+            queries: vec![Query {
+                q: "channels".into(),
+                lang: Some("yaml".into()),
+                mode: "lexical".into(),
+                detail: "locate".into(),
+                ..base_query()
+            }],
+            budget_tokens: 8000,
+            exclude_seen: false,
+        });
+        assert!(
+            y.contains("app.yaml"),
+            "yaml filter should find the yaml file: {y}"
+        );
+        assert!(!y.contains("a.rs"), "yaml filter must exclude rust: {y}");
+
+        let u = engine.code(&CodeRequest {
+            queries: vec![Query {
+                q: "channels".into(),
+                lang: Some("klingon".into()),
+                mode: "lexical".into(),
+                detail: "locate".into(),
+                ..base_query()
+            }],
+            budget_tokens: 8000,
+            exclude_seen: false,
+        });
+        assert!(
+            u.contains("unknown lang `klingon`"),
+            "unknown lang must warn: {u}"
+        );
     }
 
     #[test]
