@@ -242,9 +242,10 @@ a slowdown fails the build instead of quietly slipping by.
 
 ## Project status
 
-Solid and ready to use: **217 workspace tests** plus 24 real subprocess smoke tests, clippy clean, SLOs
+Solid and ready to use: **222 workspace tests** plus 24 real subprocess smoke tests, clippy clean, SLOs
 enforced in CI. Working today: hybrid search, the full apply path, the repo-map and reference graph, MCP
-Resources, a filesystem watcher, 14-language parsing, and the security posture above. On the roadmap: a
+Resources, a filesystem watcher (out-of-band creates, edits, and deletes all reconciled),
+14-language parsing, and the security posture above. On the roadmap: a
 full LSP graph for true cross-file resolution, opt-in neural embeddings, and an encrypted team index.
 
 ```
