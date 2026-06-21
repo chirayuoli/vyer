@@ -1687,12 +1687,26 @@ impl Engine {
     /// approximation, so every result is tagged `graph=partial(approx)` and the
     /// agent can calibrate. Emits one span per definition plus a references span.
     fn refs_spans(&self, db: &Db, q: &Query) -> Vec<budget::Span> {
-        let name = q.q.trim();
+        // SCRY-119: accept a fully-qualified `PATH#SYMBOL` locator (the playbook's
+        // disambiguation form), not just a bare name — otherwise the whole locator
+        // is taken as the symbol name and resolves to nothing (false "0 refs").
+        let (qpath, name) = parse_symbol_query(&q.q);
+        let name = name.as_str();
         let files = self.scoped_files(db, q);
+        // A path qualifier, when it resolves, pins the DEFINITION to that file
+        // (disambiguating a name defined in several files/languages); references
+        // are still gathered repo-wide by name below.
+        let def_files: Vec<String> = match qpath
+            .as_deref()
+            .and_then(|p| self.resolve_indexed_path(db, p))
+        {
+            Some(r) => vec![r],
+            None => files.clone(),
+        };
 
         // definitions: exact-name symbols (tree-sitter spans when available).
         let mut defs: Vec<(String, vyer_incr::Symbol)> = Vec::new();
-        for f in &files {
+        for f in &def_files {
             for s in &db.symbols(f).symbols {
                 if s.name == name {
                     defs.push((f.clone(), s.clone()));
@@ -1708,7 +1722,13 @@ impl Engine {
         // name (inverted index), like lexical search — refs no longer search_text +
         // code_ident_lines every scoped file. The def loop above used only cheap
         // memoized symbol tables, so it stays over the full set.
-        let ref_files = self.pruned_lex_files(db, q, &files);
+        // SCRY-119: prune by the PARSED name, not the raw `q.q` (which may be a
+        // `PATH#SYMBOL` locator the token index can't match — that returned 0 refs).
+        let nq = Query {
+            q: name.to_string(),
+            ..q.clone()
+        };
+        let ref_files = self.pruned_lex_files(db, &nq, &files);
         for f in &ref_files {
             let text = match db.text(f) {
                 Some(t) => t,
@@ -1765,7 +1785,10 @@ impl Engine {
     /// symbol bodies, honestly tagged `graph=partial`). One call answers "what
     /// breaks if I change this?". Depth-capped and dedup'd.
     fn impact_spans(&self, db: &Db, q: &Query) -> Vec<budget::Span> {
-        let target = q.q.trim().to_string();
+        // SCRY-119: accept a fully-qualified `PATH#SYMBOL` locator, not just a bare
+        // name — otherwise impact treats the whole locator as the name, finds no
+        // referrers, and dangerously reports "safe to change in isolation".
+        let (_qpath, target) = parse_symbol_query(&q.q);
         let files = self.scoped_files(db, q);
 
         // One pass: collect every symbol and build an inverted index
@@ -1859,7 +1882,13 @@ impl Engine {
     /// and its tests — everything an agent needs to understand it, assembled and
     /// edge-ordered in a single response instead of 4–8 separate calls.
     fn context_spans(&self, db: &Db, q: &Query) -> Vec<budget::Span> {
-        let target = q.q.trim().to_string();
+        // SCRY-119: accept a fully-qualified `PATH#SYMBOL` locator, not just a bare
+        // name (else the whole locator is taken as the symbol name -> "no symbol
+        // named …"). A resolved path qualifier pins the definition to that file.
+        let (qpath, target) = parse_symbol_query(&q.q);
+        let def_file = qpath
+            .as_deref()
+            .and_then(|p| self.resolve_indexed_path(db, p));
         let files = self.scoped_files(db, q);
         // Index symbols by name and capture each symbol's referenced identifiers.
         let mut by_name: HashSet<String> = HashSet::new();
@@ -1870,7 +1899,7 @@ impl Engine {
         for f in &files {
             for s in &db.symbols(f).symbols {
                 by_name.insert(s.name.clone());
-                if s.name == target {
+                if s.name == target && def_file.as_ref().map_or(true, |df| df == f) {
                     defs.push((f.clone(), s.clone()));
                 }
             }
@@ -1880,7 +1909,13 @@ impl Engine {
         // reference the target, so a file without it can hold no caller (same
         // sound prune as refs/SCRY-061). On large repos this is the difference
         // between O(all symbols) and O(symbols in name-containing files).
-        let caller_files = self.pruned_lex_files(db, q, &files);
+        // SCRY-119: prune by the PARSED target name, not the raw `q.q` (a
+        // `PATH#SYMBOL` locator wouldn't match the token index).
+        let nq = Query {
+            q: target.clone(),
+            ..q.clone()
+        };
+        let caller_files = self.pruned_lex_files(db, &nq, &files);
         for f in &caller_files {
             let text = match db.text(f) {
                 Some(t) => t,
@@ -2744,10 +2779,23 @@ impl Engine {
                     // Phase 1: build + validate every changed file (no writes yet).
                     let mut changes: Vec<(String, String, std::path::PathBuf, usize)> = Vec::new();
                     let mut total = 0usize;
+                    // SCRY-119: a repo-wide rename is whole-word + comment/string aware,
+                    // but it is NOT cross-language symbol resolution — a same-named symbol
+                    // in another language (or prose in a `.md`) is a DIFFERENT thing.
+                    // Confine to the defining symbol's own language family so renaming a
+                    // Python class can't rewrite an unrelated TypeScript interface or
+                    // README text. `path_scope` gives finer control.
+                    let def_lang = match db.lang(&path) {
+                        vyer_incr::Lang::Generic => vyer_incr::detect_lang(&path),
+                        l => l,
+                    };
                     for f in db.files() {
-                        // SCRY-105: confine a repo-wide rename to the requested globs
-                        // (monorepo: rename `handler` in ONE package, not every package).
                         if !e.path_scope.is_empty() && !path_in_scope(&f, &e.path_scope) {
+                            continue;
+                        }
+                        // SCRY-119: skip files outside the defining symbol's language
+                        // family (a same-named symbol elsewhere is a different symbol).
+                        if !same_lang_family(db.lang(&f), def_lang) {
                             continue;
                         }
                         let text = match db.text(&f) {
@@ -4549,6 +4597,37 @@ fn is_plain_ident(q: &str) -> bool {
         && q.chars()
             .next()
             .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+}
+
+/// SCRY-119: accept a fully-qualified locator `PATH#SYMBOL[@Lx-y]` as a graph
+/// query target (the disambiguated form the playbook recommends), not just a bare
+/// `SYMBOL`. Returns (optional path scope, symbol name). Without a `#`, the whole
+/// string is the name — unchanged behavior.
+fn parse_symbol_query(q: &str) -> (Option<String>, String) {
+    let q = q.trim();
+    let (path, sym) = match q.rsplit_once('#') {
+        Some((p, s)) if !p.trim().is_empty() && !s.trim().is_empty() => {
+            (Some(p.trim().to_string()), s.trim())
+        }
+        _ => (None, q),
+    };
+    // Drop a trailing `@Lstart-end` range and any `:: blake3=…` suffix.
+    let sym = sym.split("@L").next().unwrap_or(sym);
+    let sym = sym.split(" :: ").next().unwrap_or(sym);
+    (path, sym.trim().to_string())
+}
+
+/// SCRY-119: two languages a symbol rename may legitimately span. Same language
+/// always matches; the JS/TS/TSX family is one (a symbol can move between them);
+/// every other language is confined to itself — so renaming a Python class never
+/// rewrites a same-named TypeScript interface or prose in a `.md`.
+fn same_lang_family(a: vyer_incr::Lang, b: vyer_incr::Lang) -> bool {
+    use vyer_incr::Lang::{JavaScript, Tsx, TypeScript};
+    if a == b {
+        return true;
+    }
+    let web = |l: vyer_incr::Lang| matches!(l, JavaScript | TypeScript | Tsx);
+    web(a) && web(b)
 }
 
 /// SCRY-047: identifier tokens (≥3 chars, lowercased) of a PURE LITERAL phrase

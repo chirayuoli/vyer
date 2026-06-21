@@ -320,6 +320,84 @@ fn edit_loads_on_disk_file_absent_from_index() {
 }
 
 #[test]
+fn graph_details_accept_qualified_locator() {
+    // SCRY-119: refs/impact must resolve a fully-qualified `PATH#SYMBOL` locator
+    // (the disambiguation form), not just a bare name — else they treat the whole
+    // locator as the symbol name and return nothing (impact then falsely reports
+    // "safe to change in isolation").
+    let (_d, root) = fixture();
+    std::fs::write(
+        root.join("src/money.rs"),
+        "pub struct Money {\n    cents: u64,\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/cart.rs"),
+        "use crate::money::Money;\npub fn total() -> Money {\n    Money { cents: 0 }\n}\n",
+    )
+    .unwrap();
+    let eng = engine(&root, false);
+
+    let qualified = "src/money.rs#Money";
+    let refs = eng.code(&one(qualified, "graph", "refs"));
+    assert!(
+        refs.contains("defs=1") && !refs.contains("refs=0"),
+        "qualified refs must resolve the def and find references: {refs}"
+    );
+    let impact = eng.code(&one(qualified, "graph", "impact"));
+    assert!(
+        !impact.contains("safe to change in isolation"),
+        "qualified impact must find referrers, not falsely greenlight: {impact}"
+    );
+    // bare name still works (no regression).
+    let bare = eng.code(&one("Money", "graph", "refs"));
+    assert!(bare.contains("defs=1"), "bare refs regressed: {bare}");
+}
+
+#[test]
+fn rename_is_confined_to_the_symbols_language() {
+    // SCRY-119: a repo-wide rename must not rewrite a same-named symbol in another
+    // language (or prose). Renaming the Rust `Money` must leave a TypeScript `Money`
+    // interface and a README mention untouched.
+    let (_d, root) = fixture();
+    std::fs::write(
+        root.join("src/money.rs"),
+        "pub struct Money {\n    cents: u64,\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("types.ts"),
+        "export interface Money {\n  cents: number;\n}\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("NOTES.md"), "The Money type holds cents.\n").unwrap();
+    let eng = engine(&root, true);
+
+    let out = eng
+        .code_apply(&rename_req("src/money.rs#Money", "Cash"))
+        .expect("rename should succeed");
+    assert!(out.contains("money.rs"), "rust def must be renamed: {out}");
+    assert!(
+        !out.contains("types.ts"),
+        "TS interface must NOT be touched: {out}"
+    );
+    assert!(
+        !out.contains("NOTES.md"),
+        "prose must NOT be touched: {out}"
+    );
+    let ts = eng.code(&read("types.ts", "full"));
+    assert!(
+        ts.contains("interface Money"),
+        "TS Money must survive: {ts}"
+    );
+    let rs = eng.code(&read("src/money.rs", "full"));
+    assert!(
+        rs.contains("struct Cash"),
+        "rust Money must become Cash: {rs}"
+    );
+}
+
+#[test]
 fn apply_delete_file_removes_it() {
     let (_d, root) = fixture();
     let eng = engine(&root, true);
@@ -428,8 +506,13 @@ fn rename_req(locator: &str, to: &str) -> ApplyRequest {
 #[test]
 fn rename_updates_definition_and_cross_file_references() {
     let (_d, root) = fixture();
+    // A cross-file reference in the SAME language (Rust) — this must be renamed.
+    std::fs::write(
+        root.join("src/auth/check.rs"),
+        "use crate::auth::token::validate_token;\npub fn run(t: &str) -> bool {\n    validate_token(t)\n}\n",
+    )
+    .unwrap();
     let eng = engine(&root, true);
-    // `validate_token` is defined in token.rs and referenced in README.md.
     let out = eng
         .code_apply(&rename_req(
             "src/auth/token.rs#validate_token",
@@ -445,10 +528,17 @@ fn rename_updates_definition_and_cross_file_references() {
         tok.contains("verify_token") && !tok.contains("validate_token"),
         "def: {tok}"
     );
+    let check = eng.code(&read("src/auth/check.rs", "full"));
+    assert!(
+        check.contains("verify_token"),
+        "same-language cross-file reference must be renamed: {check}"
+    );
+    // SCRY-119: prose (README.md, Generic) is NOT code — a code-symbol rename must
+    // leave it untouched (previously this test asserted the opposite, the bug).
     let readme = eng.code(&read("README.md", "full"));
     assert!(
-        readme.contains("verify_token"),
-        "cross-file reference not renamed: {readme}"
+        !readme.contains("verify_token") && readme.contains("validate_token"),
+        "prose must not be renamed: {readme}"
     );
 }
 
