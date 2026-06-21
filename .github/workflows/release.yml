@@ -1,0 +1,44 @@
+name: release
+
+# Tag a version (e.g. `git tag v0.1.0 && git push origin v0.1.0`) → this builds the
+# `vyer` binary for every platform and attaches the archives (+ sha256) to a GitHub
+# Release. Those archives are what `npx vyer`, the Homebrew formula, and the
+# "download a prebuilt binary" path all consume.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Builds `--bin vyer` for the target (cross-compiling where needed), packages it
+      # as vyer-<tag>-<target>.(tar.gz|zip), emits a .sha256, and uploads to the Release.
+      - uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: vyer
+          target: ${{ matrix.target }}
+          archive: vyer-$tag-$target
+          checksum: sha256
+          token: ${{ secrets.GITHUB_TOKEN }}

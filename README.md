@@ -79,13 +79,22 @@ model any attention to use.
 
 Three steps, about a minute.
 
-**1. Install it.**
+**1. Install it.** No toolchain, no clone:
 
 ```sh
-# from source (you'll need the Rust toolchain)
-cargo install --path crates/vyer-server     # gives you the `vyer` binary
-# or just grab a prebuilt binary from Releases (macOS / Linux / Windows)
+npx -y vyer serve --root .                     # via npm — just needs Node
+brew install chirayuoli/tap/vyer               # via Homebrew
+# …or download a prebuilt binary from the Releases page (macOS / Linux / Windows)
 ```
+
+Prefer to build from source? No clone needed either (needs the Rust toolchain):
+
+```sh
+cargo install --git https://github.com/chirayuoli/vyer vyer-server   # Cargo fetches + builds it
+```
+
+> The npm / Homebrew / prebuilt channels light up with the first tagged release (`v0.1.0`) —
+> the pipeline is wired (`docs/RELEASING.md`). Building from source works today.
 
 **2. Point your agent at it.** Vyer indexes the current repo automatically and talks over stdio, so
 there's no network and nothing to configure:
