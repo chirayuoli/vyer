@@ -541,15 +541,43 @@ pub fn prepare_insert(
             let s0 = (resolve_span(syms, sym, *r)?.0 as usize).saturating_sub(1);
             line_indent(lines[s0.min(lines.len().saturating_sub(1))]).to_string()
         }
-        InsertPos::Into(_, _) => {
-            // an existing member's indent (the non-blank line just inside the
-            // insertion point); column 0 only for a truly empty container.
-            (0..at)
-                .rev()
-                .map(|i| lines[i])
-                .find(|l| !l.trim().is_empty())
-                .map(|l| line_indent(l).to_string())
-                .unwrap_or_default()
+        InsertPos::Into(sym, r) => {
+            if lang == Lang::Python {
+                // SCRY-121: Python @into must indent the new member at the CLASS-BODY
+                // level — the SHALLOWEST indent among the class's body lines — not the
+                // last body line's (a nested method-body line), which placed the
+                // member INSIDE the previous method. Brace languages are unchanged.
+                let (lo, hi) = resolve_span(syms, sym, *r)?;
+                let lo0 = lo as usize; // first body line (the header is at lo-1)
+                let hi0 = (hi as usize).min(lines.len());
+                lines
+                    .get(lo0..hi0)
+                    .unwrap_or(&[])
+                    .iter()
+                    .filter(|l| !l.trim().is_empty())
+                    .map(|l| line_indent(l))
+                    .min_by_key(|ind| ind.len())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| {
+                        // empty class body: header indent + 4 spaces.
+                        let h = line_indent(
+                            lines[(lo as usize)
+                                .saturating_sub(1)
+                                .min(lines.len().saturating_sub(1))],
+                        );
+                        format!("{h}    ")
+                    })
+            } else {
+                // brace/`end` languages: an existing member's indent (the non-blank
+                // line just inside the insertion point); column 0 only for a truly
+                // empty container.
+                (0..at)
+                    .rev()
+                    .map(|i| lines[i])
+                    .find(|l| !l.trim().is_empty())
+                    .map(|l| line_indent(l).to_string())
+                    .unwrap_or_default()
+            }
         }
     };
     let reindented = reindent_block(new_body, &indent);
@@ -1097,6 +1125,34 @@ mod tests {
         assert!(
             matches!(err, ApplyError::ContainerInsertUnsupported { .. }),
             "single-line @into should be refused, got: {err}"
+        );
+    }
+
+    #[test]
+    fn insert_into_python_class_indents_at_class_level() {
+        // SCRY-121: @into a Python class whose last method spans multiple lines must
+        // put the new member at the class-body indent (4), NOT nested at the last
+        // method-body line's indent (8) where it became a local function.
+        let py = "class Agent:\n    def total(self):\n        return 0\n";
+        let (st, lang) = syms("m.py", py);
+        let edit = prepare_insert(
+            "m.py",
+            py,
+            &st,
+            lang,
+            InsertPos::Into("Agent".into(), None),
+            "def reset(self):\n    pass",
+        )
+        .unwrap();
+        assert!(
+            edit.new_text.contains("\n    def reset(self):"),
+            "new method must sit at the 4-space class level: {}",
+            edit.new_text
+        );
+        assert!(
+            !edit.new_text.contains("\n        def reset"),
+            "must not be nested inside the previous method: {}",
+            edit.new_text
         );
     }
 

@@ -5278,7 +5278,12 @@ fn is_generated(path: &str) -> bool {
         ".designer.cs",
     ];
     let p = path.to_ascii_lowercase();
-    SUFFIXES.iter().any(|s| p.ends_with(s)) || p.contains(".generated.")
+    SUFFIXES.iter().any(|s| p.ends_with(s))
+        || p.contains(".generated.")
+        // SCRY-122: files under a `generated/` (or `__generated__/`) directory are
+        // codegen too — tag + demote them like the suffix-based artifacts.
+        || p.split('/')
+            .any(|seg| seg == "generated" || seg == "__generated__")
 }
 
 /// Short content hash for staleness detection in the locator. (blake3 in the
@@ -7034,6 +7039,17 @@ mod tests {
         // sanity: the helper flags codegen, not plain sources.
         assert!(is_generated("a/b.g.dart") && is_generated("x_pb2.py"));
         assert!(!is_generated("src/engine.rs") && !is_generated("model.dart"));
+    }
+
+    #[test]
+    fn generated_dir_files_are_tagged_codegen() {
+        // SCRY-122: a file under a `generated/` directory is codegen even without a
+        // codegen filename suffix (e.g. a `// @generated` TS type file).
+        assert!(is_generated("generated/api_types.ts"));
+        assert!(is_generated("src/generated/api_types.ts"));
+        assert!(is_generated("app/__generated__/schema.py"));
+        assert!(!is_generated("src/api_types.ts"));
+        assert!(!is_generated("src/generator.rs"));
     }
 
     #[test]
