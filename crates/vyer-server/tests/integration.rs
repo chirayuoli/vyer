@@ -277,6 +277,53 @@ fn apply_delete_symbol_removes_it() {
 }
 
 #[test]
+fn delete_on_disk_file_absent_from_index() {
+    // SCRY-115: a file present on disk but missing from the warm index (it
+    // predated indexing, was gitignored, or the watcher missed it) must still be
+    // deletable — otherwise code_apply fails all-or-nothing and the agent falls
+    // back to native tools. Regression for the "@delete: not indexed" report.
+    let (_d, root) = fixture();
+    let eng = engine(&root, true);
+    // Created on disk AFTER indexing -> present on disk, absent from the warm core.
+    std::fs::write(root.join("src/orphan.rs"), "fn orphan() {}\n").unwrap();
+    let out = eng.code_apply(&one_edit("src/orphan.rs#@delete", None, None, None));
+    assert!(
+        out.is_ok(),
+        "delete of on-disk-but-unindexed file should succeed: {out:?}"
+    );
+    assert!(
+        !root.join("src/orphan.rs").exists(),
+        "file should be gone from disk"
+    );
+}
+
+#[test]
+fn edit_loads_on_disk_file_absent_from_index() {
+    // SCRY-115: the same gap for an EDIT (not just delete) — an anchor edit on a
+    // file present on disk but missing from the index pulls it in on demand
+    // instead of failing "file not indexed".
+    let (_d, root) = fixture();
+    let eng = engine(&root, true);
+    std::fs::write(
+        root.join("src/orphan.rs"),
+        "fn orphan() { let a = 1; }\n",
+    )
+    .unwrap();
+    let out = eng.code_apply(&one_edit(
+        "src/orphan.rs",
+        Some("let a = 1;"),
+        Some("let a = 2;"),
+        None,
+    ));
+    assert!(
+        out.is_ok(),
+        "edit of on-disk-but-unindexed file should succeed: {out:?}"
+    );
+    let read = eng.code(&read("src/orphan.rs", "full"));
+    assert!(read.contains("let a = 2;"), "edit not applied: {read}");
+}
+
+#[test]
 fn apply_delete_file_removes_it() {
     let (_d, root) = fixture();
     let eng = engine(&root, true);

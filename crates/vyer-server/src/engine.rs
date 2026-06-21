@@ -2992,14 +2992,30 @@ impl Engine {
 
                 // ---- DELETE FILE (SCRY-026): `PATH#@delete` ----
                 if target.as_deref() == Some("@delete") {
-                    if db.text(&path).is_none() {
-                        return Err(format!("cannot delete {path}: not indexed"));
+                    // SCRY-115: a file can exist on disk yet be absent from the warm
+                    // index (predated indexing, gitignored, or the watcher missed it).
+                    // Don't refuse then — fall back to on-disk existence. Only a path
+                    // in NEITHER place is a real error.
+                    let in_index = db.text(&path).is_some();
+                    if !in_index && !target_path.exists() {
+                        return Err(format!(
+                            "cannot delete {path}: not found (neither in the index nor on disk)"
+                        ));
                     }
                     report.push_str(&format!("--- a/{path}\n+++ /dev/null\n"));
                     if req.dry_run {
                         report.push_str("(dry_run: not deleted)\n");
                     } else {
-                        snapshot(&mut originals, &db, &path);
+                        // SCRY-115: snapshot for undo — prefer the warm copy; if the
+                        // file is on disk but not indexed, capture the disk bytes so
+                        // `undo` can restore it.
+                        if in_index {
+                            snapshot(&mut originals, &db, &path);
+                        } else {
+                            originals
+                                .entry(path.clone())
+                                .or_insert_with(|| std::fs::read_to_string(&target_path).ok());
+                        }
                         db.remove_text(&path);
                         pending.push(DiskOp::Delete(target_path.clone()));
                         report.push_str("(deleted; warm core updated)\n");
@@ -3009,9 +3025,19 @@ impl Engine {
                     continue;
                 }
 
-                // Every other op needs the file already indexed.
+                // Every other op needs the file's current text. SCRY-115: if it's
+                // missing from the warm index but present on disk (predated indexing,
+                // gitignored, or the watcher missed it), pull it in on demand instead
+                // of forcing a native-tool fallback.
+                if db.text(&path).is_none() {
+                    if let Ok(disk) = std::fs::read_to_string(&target_path) {
+                        if !disk.as_bytes().contains(&0) {
+                            db.set_text(&path, &disk);
+                        }
+                    }
+                }
                 let current = db.text(&path).ok_or_else(|| {
-                format!("file not indexed: {path} (to create it, use locator `{path}#@new` with new_body)")
+                format!("file not found: {path} (not in the index and no such file on disk; to create it, use `{path}#@new` with new_body)")
             })?;
                 let syms = vyer_incr::SymbolTable {
                     symbols: db.symbols(&path).symbols.clone(),
