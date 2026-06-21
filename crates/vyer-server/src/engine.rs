@@ -1103,7 +1103,11 @@ impl Engine {
                     None => lines.get((c.start as usize).saturating_sub(1)).copied().unwrap_or("").trim().to_string(),
                 }
             }
-            "full" => slice_lines(&lines, 1, lines.len() as u32, 400),
+            // NEW-A/SCRY-120: a `full` search hit returns the SYMBOL's own body
+            // (c.start..c.end), so the line numbers added below match the locator's
+            // @L range. Slicing the whole file here numbered every line from the
+            // symbol's start, mis-targeting any edit keyed off the output.
+            "full" => slice_lines(&lines, c.start, c.end, 400),
             _ /* snippet */ => slice_lines(&lines, c.start, c.end, 200),
         };
         // Prefix each line with its real line number so locators are clickable.

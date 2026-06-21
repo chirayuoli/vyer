@@ -355,6 +355,31 @@ fn graph_details_accept_qualified_locator() {
 }
 
 #[test]
+fn full_detail_numbers_match_the_symbol_body() {
+    // NEW-A / SCRY-120: detail=full on a search hit must return the SYMBOL's body
+    // numbered from its real start line — not the whole file numbered from the
+    // symbol's start (which left every line off, mis-targeting edits).
+    let (_d, root) = fixture();
+    std::fs::write(
+        root.join("src/sched.rs"),
+        "// header line 1\n// header line 2\n// header line 3\npub struct Scheduler {\n    n: u8,\n}\n",
+    )
+    .unwrap();
+    let eng = engine(&root, false);
+    let out = eng.code(&one("Scheduler", "structural", "full"));
+    // The struct starts at line 4; the first numbered body line must be "4:" and
+    // contain the struct header, NOT the file's line-1 comment.
+    assert!(
+        out.contains("4: pub struct Scheduler"),
+        "full body must start numbered at the symbol's line: {out}"
+    );
+    assert!(
+        !out.contains("1: // header line 1"),
+        "full must not dump the whole file numbered from the symbol start: {out}"
+    );
+}
+
+#[test]
 fn rename_is_confined_to_the_symbols_language() {
     // SCRY-119: a repo-wide rename must not rewrite a same-named symbol in another
     // language (or prose). Renaming the Rust `Money` must leave a TypeScript `Money`
