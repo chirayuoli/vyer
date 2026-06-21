@@ -304,11 +304,7 @@ fn edit_loads_on_disk_file_absent_from_index() {
     // instead of failing "file not indexed".
     let (_d, root) = fixture();
     let eng = engine(&root, true);
-    std::fs::write(
-        root.join("src/orphan.rs"),
-        "fn orphan() { let a = 1; }\n",
-    )
-    .unwrap();
+    std::fs::write(root.join("src/orphan.rs"), "fn orphan() { let a = 1; }\n").unwrap();
     let out = eng.code_apply(&one_edit(
         "src/orphan.rs",
         Some("let a = 1;"),
