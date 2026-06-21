@@ -1,6 +1,6 @@
 [package]
 name = "vyer-incr"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Minimal incremental query engine (Salsa-style) + symbol extraction for the code-context engine. Demonstrates read-after-write freshness: editing one file recomputes only its derived queries. Zero dependencies."
 

@@ -1156,15 +1156,15 @@ checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 
 [[package]]
 name = "vyer-core"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "vyer-incr"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "vyer-index"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "streaming-iterator",
  "tree-sitter",
@@ -1187,7 +1187,7 @@ dependencies = [
 
 [[package]]
 name = "vyer-server"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aho-corasick",
  "grep-matcher",

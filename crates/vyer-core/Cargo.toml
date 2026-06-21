@@ -1,6 +1,6 @@
 [package]
 name = "vyer-core"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Pure-logic core for the code-context engine: locators, RRF fusion, budget packing, lost-in-the-middle ordering, path sandbox, untrusted output formatting. Zero dependencies."
 

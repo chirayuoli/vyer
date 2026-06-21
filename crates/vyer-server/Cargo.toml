@@ -1,6 +1,6 @@
 [package]
 name = "vyer-server"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Secure MCP front end + CLI for Vyer, the local-first code-context engine. Exposes one `code` tool (lexical+structural search, compact UNTRUSTED output, freshness) and a gated, sandboxed `code_apply`."
 
