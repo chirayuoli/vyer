@@ -25,10 +25,10 @@ fast.
    `macos-arm64`, `macos-x64`, `linux-x64`, `linux-arm64`, `windows-x64`. Attach to **GitHub Releases**.
    Everything below downloads these.
 2. **npm wrapper — the priority channel.** Most Claude Code / Cursor users wire MCP via `npx`. Publish
-   `@vyer/cli` whose `postinstall` downloads the right prebuilt binary (the esbuild/turbo/biome pattern).
+   `@0x1labs/vyer` whose `postinstall` downloads the right prebuilt binary (the esbuild/turbo/biome pattern).
    Then onboarding is literally:
    ```jsonc
-   { "mcpServers": { "vyer": { "command": "npx", "args": ["-y", "@vyer/cli", "serve", "--root", "."] } } }
+   { "mcpServers": { "vyer": { "command": "npx", "args": ["-y", "@0x1labs/vyer", "serve", "--root", "."] } } }
    ```
    Add `vyer init --global` to the postinstall (or print a one-line nudge to run it).
 3. **Homebrew tap.** `brew install vyer-dev/tap/vyer`. Homebrew forbids auto-editing files → use a

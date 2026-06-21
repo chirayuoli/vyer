@@ -1,5 +1,5 @@
 {
-  "name": "@vyer/cli",
+  "name": "@0x1labs/vyer",
   "version": "0.1.0",
   "publishConfig": { "access": "public" },
   "description": "Vyer — the warm code-context engine for AI coding agents (MCP server).",

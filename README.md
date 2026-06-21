@@ -82,7 +82,7 @@ Three steps, about a minute.
 **1. Install it.** No toolchain, no clone:
 
 ```sh
-npx -y @vyer/cli serve --root .                # via npm — just needs Node
+npx -y @0x1labs/vyer serve --root .                # via npm — just needs Node
 brew install chirayuoli/tap/vyer               # via Homebrew
 # …or download a prebuilt binary from the Releases page (macOS / Linux / Windows)
 ```

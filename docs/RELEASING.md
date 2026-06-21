@@ -31,16 +31,16 @@ steps are called out.
 
 ## Publish to npm (manual — needs your npm auth)
 
-The package publishes as **`@vyer/cli`** — npm blocks the bare `vyer` as too similar to
-existing names, so it's scoped. One-time: create the free `vyer` org at npmjs.com/org/create
-(if that org name is taken, fall back to `@chirayuoli/vyer`).
+The package publishes as **`@0x1labs/vyer`** under the `0x1labs` npm org (npm blocks the bare
+`vyer` as too similar to existing names, so it must be scoped). You're an owner of that org,
+so `npm publish` goes straight through.
 
 ```sh
 cd npm
 npm publish            # first time: `npm login`; `publishConfig.access=public` ships it public
 ```
 
-Now `npx @vyer/cli serve --root .` works for everyone. (Tip: a `publish` job can be added to
+Now `npx @0x1labs/vyer serve --root .` works for everyone. (Tip: a `publish` job can be added to
 `release.yml` with an `NPM_TOKEN` secret to automate this on tag.)
 
 ## Publish the Homebrew tap (manual, first time)
@@ -58,6 +58,6 @@ checksums — the standard `brew bump-formula-pr` flow.)
 | Path | Command | Needs |
 |---|---|---|
 | Prebuilt binary | download from Releases, `tar xzf`, run | nothing |
-| npm | `npx @vyer/cli serve --root .` | Node |
+| npm | `npx @0x1labs/vyer serve --root .` | Node |
 | Homebrew | `brew install chirayuoli/tap/vyer` | brew |
 | From source | `cargo install --git https://github.com/chirayuoli/vyer vyer-server` | Rust toolchain |
