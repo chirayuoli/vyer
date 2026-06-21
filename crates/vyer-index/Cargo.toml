@@ -1,6 +1,6 @@
 [package]
 name = "vyer-index"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 description = "Real parsing for Vyer: tree-sitter grammars (Rust/Python/JS/TS/Go) producing the same ParseTree the incremental core memoizes. Attaches at vyer-incr's parser-injection hook; the incremental spine is untouched."
 
