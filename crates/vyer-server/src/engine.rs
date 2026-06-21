@@ -1903,7 +1903,7 @@ impl Engine {
         for f in &files {
             for s in &db.symbols(f).symbols {
                 by_name.insert(s.name.clone());
-                if s.name == target && def_file.as_ref().map_or(true, |df| df == f) {
+                if s.name == target && def_file.as_ref().is_none_or(|df| df == f) {
                     defs.push((f.clone(), s.clone()));
                 }
             }
