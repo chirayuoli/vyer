@@ -34,8 +34,8 @@ jobs:
         include:
           - target: aarch64-apple-darwin
             os: macos-latest
-          - target: x86_64-apple-darwin
-            os: macos-13
+          # Intel macOS (x86_64-apple-darwin) is intentionally not built: GitHub's
+          # macos-13 runner queue is unreliable. Intel-Mac users install from source.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
           - target: aarch64-unknown-linux-gnu

@@ -16,7 +16,8 @@ const VERSION = require("./package.json").version;
 // node platform+arch  ->  Rust target triple (must match release.yml's matrix)
 const TARGETS = {
   "darwin arm64": "aarch64-apple-darwin",
-  "darwin x64": "x86_64-apple-darwin",
+  // Intel macOS (x86_64-apple-darwin) is intentionally not published; this
+  // bails to the from-source hint for it. See release.yml + packaging/homebrew.
   "linux x64": "x86_64-unknown-linux-gnu",
   "linux arm64": "aarch64-unknown-linux-gnu",
   "win32 x64": "x86_64-pc-windows-msvc",
