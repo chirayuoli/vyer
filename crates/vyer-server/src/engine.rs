@@ -469,6 +469,16 @@ impl Engine {
                 continue;
             }
 
+            // SUPERPOWER (SCRY-118): `detail=import` — resolve `q` (a symbol) to its defining file
+            // via the index, and (with `path` = the file to import INTO) construct the exact import
+            // statement for that file's language. The reliable half of "add-import": vyer KNOWS
+            // where the symbol lives; the agent inserts the returned line. (Auto-insertion is the
+            // LSP-gated tier — see docs/REFACTOR-AND-DEPS.md.)
+            if query.detail == "import" {
+                spans.extend(self.import_spans(&db, query));
+                continue;
+            }
+
             // `refs` (graph) is its own path: resolve definition(s) + approximate
             // cross-file references. We have no LSP yet, so the resolution is a
             // tree-sitter/lexical approximation and is HONESTLY reported as
@@ -1369,6 +1379,65 @@ impl Engine {
             });
         }
         spans
+    }
+
+    /// SCRY-118: `detail=import` — resolve `q` (a symbol) to its defining file via the index, and
+    /// (with `path` = the file to import INTO) build the exact import statement for that file's
+    /// language. Vyer knows where every symbol lives; this hands the agent the precise line to add.
+    fn import_spans(&self, db: &Db, q: &Query) -> Vec<budget::Span> {
+        let sym = q.q.trim();
+        if sym.is_empty() {
+            return vec![budget::Span {
+                id: "import".into(),
+                text: "detail=import needs q=<SymbolName>; add path=<file to import INTO> for the exact statement\n".into(),
+                score: 1.0,
+            }];
+        }
+        let mut defs: Vec<String> = Vec::new();
+        for f in db.files() {
+            if db.symbols(&f).symbols.iter().any(|s| s.name == sym) {
+                defs.push(f);
+            }
+        }
+        if defs.is_empty() {
+            return vec![budget::Span {
+                id: format!("import:{sym}"),
+                text: format!(
+                    "`{sym}` is not defined in any indexed file — check the name, or it lives in a \
+                     dependency (dependency-source navigation is on the roadmap)\n"
+                ),
+                score: 1.0,
+            }];
+        }
+        let target = q
+            .path
+            .as_deref()
+            .and_then(|p| self.resolve_indexed_path(db, p));
+        let mut out = String::new();
+        for def in &defs {
+            if Some(def.as_str()) == target.as_deref() {
+                out.push_str(&format!(
+                    "`{sym}` is already in this file ({def}) — no import needed\n"
+                ));
+            } else if let Some(t) = &target {
+                out.push_str(&format!("{}\n", build_import(sym, t, def)));
+            } else {
+                out.push_str(&format!(
+                    "`{sym}` is defined in {def}; pass path=<file to import INTO> for the exact import line\n"
+                ));
+            }
+        }
+        if defs.len() > 1 {
+            out.push_str(&format!(
+                "(note: {sym} is defined in {} files — pick the intended one)\n",
+                defs.len()
+            ));
+        }
+        vec![budget::Span {
+            id: format!("import:{sym}"),
+            text: out,
+            score: 1.0,
+        }]
     }
 
     /// `detail=count` — the grep -c / wc -l replacement, as one summary span.
@@ -4975,6 +5044,67 @@ fn parse_diagnostics(blob: &str) -> Vec<(String, u32)> {
     out
 }
 
+/// SCRY-118: relative path from `from_file`'s directory to `to_file` (both repo-relative),
+/// e.g. lib/screens/home.dart → lib/models/user.dart  ⇒  ../models/user.dart. For JS/Dart imports.
+fn relpath(from_file: &str, to_file: &str) -> String {
+    let from: Vec<&str> = from_file.split('/').collect();
+    let to: Vec<&str> = to_file.split('/').collect();
+    let from_dir = &from[..from.len().saturating_sub(1)];
+    let mut i = 0;
+    while i < from_dir.len() && i + 1 < to.len() && from_dir[i] == to[i] {
+        i += 1;
+    }
+    let mut parts: Vec<String> = Vec::new();
+    for _ in 0..(from_dir.len() - i) {
+        parts.push("..".to_string());
+    }
+    for c in &to[i..] {
+        parts.push((*c).to_string());
+    }
+    let rel = parts.join("/");
+    if rel.starts_with("..") {
+        rel
+    } else {
+        format!("./{rel}")
+    }
+}
+
+/// SCRY-118: construct the import statement bringing `sym` (defined in `def`) into `target`, in
+/// `target`'s language. Relative-path languages (TS/JS/Dart) are exact — vyer verified the symbol
+/// is defined in `def` and the file exists; module-path languages (Python/Rust) are best-effort
+/// (the agent verifies); Go is package-level → a note. Always actionable.
+fn build_import(sym: &str, target: &str, def: &str) -> String {
+    let strip_ext = |p: &str| {
+        p.rsplit_once('.')
+            .map(|(a, _)| a.to_string())
+            .unwrap_or_else(|| p.to_string())
+    };
+    match target.rsplit('.').next().unwrap_or("") {
+        "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" => {
+            format!(
+                "import {{ {sym} }} from '{}';",
+                strip_ext(&relpath(target, def))
+            )
+        }
+        "dart" => format!("import '{}';", relpath(target, def)),
+        "py" => format!(
+            "from {} import {sym}    # best-effort module path — verify",
+            strip_ext(def).replace('/', ".")
+        ),
+        "rs" => {
+            let m = def.rsplit_once("src/").map(|(_, b)| b).unwrap_or(def);
+            format!(
+                "use crate::{}::{sym};    // best-effort module path — verify",
+                strip_ext(m).replace('/', "::")
+            )
+        }
+        "go" => format!(
+            "// `{sym}` is in {def}; Go imports are package-level — import that package path"
+        ),
+        _ => format!("// `{sym}` is defined in {def}; add an import in {target}'s style"),
+    }
+}
+
 fn make_id(path: &str, symbol: Option<&str>, start: u32, end: u32, text: &str) -> String {
     let loc = Locator {
         path: path.to_string(),
@@ -5731,6 +5861,41 @@ mod tests {
             "make directive must be skipped: {info}"
         );
         assert!(info.contains("mode=diagnose"), "bridge to diagnose: {info}");
+    }
+
+    #[test]
+    fn import_resolves_symbol_and_builds_statement() {
+        let engine = engine_with(&[
+            ("src/models/user.ts", "export class User {}\n"),
+            ("src/screens/home.ts", "export function home() {}\n"),
+        ]);
+        let with_target = engine.code(&CodeRequest {
+            queries: vec![Query {
+                q: "User".into(),
+                path: Some("src/screens/home.ts".into()),
+                detail: "import".into(),
+                ..base_query()
+            }],
+            budget_tokens: 8000,
+            exclude_seen: false,
+        });
+        assert!(
+            with_target.contains("import { User } from '../models/user'"),
+            "exact relative ts import: {with_target}"
+        );
+        let unknown = engine.code(&CodeRequest {
+            queries: vec![Query {
+                q: "NoSuchSymbol".into(),
+                detail: "import".into(),
+                ..base_query()
+            }],
+            budget_tokens: 8000,
+            exclude_seen: false,
+        });
+        assert!(
+            unknown.contains("not defined in any indexed file"),
+            "honest unknown: {unknown}"
+        );
     }
 
     fn base_query() -> Query {

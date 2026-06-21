@@ -132,7 +132,8 @@ file, not just code). Prefer it over the native file tools for anything inside t
 - READ / SEARCH / NAVIGATE with `mcp__vyer__code` (instead of Read / Grep / Glob): read a file or range \
 (path + lines like 40-80 — replaces Read/sed/head/tail); find code (q + mode auto/lexical/structural/\
 graph/semantic; detail locate/outline/snippet/full); understand a symbol (detail=context = def + callers \
-+ callees + tests; detail=impact; detail=refs); list with detail=tree, count with detail=count.\n\
++ callees + tests; detail=impact; detail=refs); list with detail=tree, count with detail=count; need an \
+import? detail=import resolves a symbol to its defining file and builds the import line.\n\
 - EDIT / CREATE / DELETE with `mcp__vyer__code_apply` (instead of Edit / Write): new_body, anchor+replace, \
 repo-wide rename, move_to, @after/@before/@into/@end, @new (create a file), @delete, undo — atomic and \
 re-parse-validated.\n\

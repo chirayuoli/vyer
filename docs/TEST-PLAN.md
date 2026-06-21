@@ -35,6 +35,9 @@ the one-line result.
 - [ ] `{ q:"reindex_path", detail:"context" }` → its definition + callers + callees + tests in one call.
 - [ ] `{ q:"reindex_path", detail:"impact" }` → the transitive blast radius (direct + ripple referrers).
 - [ ] `{ q:"reindex_path", detail:"refs" }` → definition + call sites (tagged `graph=partial(approx)`).
+- [ ] **NEW import resolver**: `{ q:"Engine", detail:"import", path:"crates/vyer-server/src/main.rs" }`
+      → `use crate::…::Engine;` (resolves the symbol's defining file + builds the import line). An unknown
+      symbol → honest "not defined in any indexed file" (no wrong guess).
 
 ## 3. Edit safely (`mcp__vyer__code_apply`, gated, atomic, re-parse-validated)
 Use a scratch file so you don't disturb the repo: `code_apply { locator:"scratch/t.rs#@new", new_body:"fn alpha() { let n = 1; }\nfn beta() { alpha(); }\n" }`.
