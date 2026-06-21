@@ -337,6 +337,21 @@ impl Engine {
                 db.set_text(&rel, &text);
             }
         }
+
+        // SCRY-114: reconcile DELETIONS. The walk above ADDS/UPDATES every file
+        // present on disk, but a file removed out-of-band (shell `rm`, `git
+        // checkout`) would otherwise linger in the warm core until restart. Drop
+        // every indexed file whose path no longer exists. We test on-disk
+        // existence (not walk membership) so a gitignored-but-present file added
+        // via `code_apply` is NOT purged.
+        let stale: Vec<String> = db
+            .files()
+            .into_iter()
+            .filter(|rel| !root.join(rel).exists())
+            .collect();
+        for rel in stale {
+            db.remove_text(&rel);
+        }
         Ok(())
     }
 

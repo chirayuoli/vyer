@@ -2135,6 +2135,32 @@ fn reindex_purges_externally_removed_content() {
 }
 
 #[test]
+fn reindex_all_purges_externally_deleted_files() {
+    // §6 watcher: a file DELETED out-of-band (shell `rm`, `git checkout`) must
+    // leave the index after a full rescan, not linger until restart. The walk
+    // only ADDS/UPDATES present files; `index_repo` reconciles deletions by
+    // dropping indexed paths that no longer exist (SCRY-114). Complements
+    // `reindex_purges_externally_removed_content` (an emptied-but-present file).
+    let (_d, root) = fixture();
+    let eng = engine(&root, false);
+    assert!(
+        eng.code(&one("login", "lexical", "snippet"))
+            .contains("pub fn login"),
+        "login should exist initially"
+    );
+
+    // Delete the whole file, outside vyer.
+    std::fs::remove_file(root.join("src/auth/login.rs")).unwrap();
+    eng.reindex_all().unwrap();
+
+    let after = eng.code(&one("login", "lexical", "snippet"));
+    assert!(
+        !after.contains("pub fn login"),
+        "deleted file's content still indexed after rescan: {after}"
+    );
+}
+
+#[test]
 fn build_and_vendor_dirs_are_not_indexed() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_path_buf();
