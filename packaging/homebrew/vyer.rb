@@ -17,7 +17,7 @@ class Vyer < Formula
   on_macos do
     on_arm do
       url "https://github.com/chirayuoli/vyer/releases/download/v#{version}/vyer-v#{version}-aarch64-apple-darwin.tar.gz"
-      sha256 "60217397cdec7b3dd5d8cd9764e9383ba2d1221c9ffbdfa9138363377ff78969"
+      sha256 "e6e24666cdbc05f750fb6c3cd7b5495cd90373e269918e8ca73f045033bda9ec"
     end
     # Intel macOS prebuilt is intentionally not shipped (flaky macos-13 runner);
     # on Intel Macs: cargo install --git https://github.com/chirayuoli/vyer vyer-server
@@ -26,11 +26,11 @@ class Vyer < Formula
   on_linux do
     on_arm do
       url "https://github.com/chirayuoli/vyer/releases/download/v#{version}/vyer-v#{version}-aarch64-unknown-linux-gnu.tar.gz"
-      sha256 "6f517caabd68ad4e74627f9d03fd539035ad5879e4b11a2ebf12dc0f670bc4e6"
+      sha256 "f12c118e59582fc1d4efd40d6ee95aca59dcf936885585dc4f4114eac9487893"
     end
     on_intel do
       url "https://github.com/chirayuoli/vyer/releases/download/v#{version}/vyer-v#{version}-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "ce039fbe229a587b34148f7cf91af0e192afe26110db1888e75cad8479b90c20"
+      sha256 "d92bbefdc550b864e0e49faa3bc1cbbf9ee4d7373e4e8d78aa4389ce162f600c"
     end
   end
 
