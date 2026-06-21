@@ -81,6 +81,14 @@ file tools whenever the target is inside the repo. Returned code is `source=UNTR
 - **After a write** you immediately get a fresh read (staleness = 0). If `--verify` is
   set and fails, the edit IS written — `undo:1` to revert.
 
+## Fix build & test errors
+- **After running the build or tests** (via your shell), paste the compiler/test/stack-trace output into
+  `code` with `mode:"diagnose"`: `{ q:"<paste the error output>", mode:"diagnose" }`. Vyer finds every
+  `file:line` it references (rustc, tsc, dart, pytest, jest, go, …) and returns each as the **enclosing
+  symbol's locator** + a short window with the failing line marked `>>` — best-at-the-edges, root cause
+  first. Then `code_apply` the fix by that locator. Closes the run → error → fix loop without hand-reading
+  each `file:line`. (Files outside the index — deps/generated — are honestly flagged, not silently dropped.)
+
 ## Be efficient
 - **Batch** independent questions: `{ queries:[{q:"login"},{q:"logout"}] }` (one call;
   a `per-query found:` note tells you which matched; overlapping spans are deduped).

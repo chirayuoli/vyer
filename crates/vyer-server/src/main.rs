@@ -26,6 +26,7 @@ fn main() -> ExitCode {
         "query" => cmd_query(&rest),
         "map" => cmd_map(&rest),
         "status" => cmd_status(&rest),
+        "project" => cmd_project(&rest),
         "apply" => cmd_apply(&rest),
         "init" => cmd_init(&rest),
         "demo" => {
@@ -125,15 +126,27 @@ const VYER_BLOCK_END: &str = "<!-- END VYER MANAGED BLOCK -->";
 fn vyer_managed_block() -> String {
     format!(
         "{VYER_BLOCK_BEGIN}\n\
-## Tooling — prefer Vyer MCP over native file tools\n\
-When the `vyer` MCP is connected, for any file inside the repo:\n\
-- Use `mcp__vyer__code` instead of Read / Grep / Glob (warm core: faster, AST-aware, token-cheap spans).\n\
-- Use `mcp__vyer__code_apply` instead of Edit / Write (atomic, re-parse-validated; rename/move/insert/delete/undo).\n\
-- WORK IN BATCHES: pass multiple queries in ONE `code` call and multiple edits in ONE `code_apply` \
-(committed all-or-nothing) — resolve N things in a single round-trip, don't loop one-at-a-time.\n\
-- Default to the cheapest detail that answers you: locate < outline < snippet < full.\n\
-- Read the `vyer://playbook` resource for intent→optimal-call recipes; `vyer://repo-map` to orient.\n\
-- Fall back to native tools ONLY for: a path outside the repo, a binary/non-text file, or running a command.\n\
+## Use the Vyer MCP for code in this repo\n\
+The `vyer` MCP server is connected — a warm, always-fresh index of THIS WHOLE repository (every text \
+file, not just code). Prefer it over the native file tools for anything inside the repo:\n\
+- READ / SEARCH / NAVIGATE with `mcp__vyer__code` (instead of Read / Grep / Glob): read a file or range \
+(path + lines like 40-80 — replaces Read/sed/head/tail); find code (q + mode auto/lexical/structural/\
+graph/semantic; detail locate/outline/snippet/full); understand a symbol (detail=context = def + callers \
++ callees + tests; detail=impact; detail=refs); list with detail=tree, count with detail=count.\n\
+- EDIT / CREATE / DELETE with `mcp__vyer__code_apply` (instead of Edit / Write): new_body, anchor+replace, \
+repo-wide rename, move_to, @after/@before/@into/@end, @new (create a file), @delete, undo — atomic and \
+re-parse-validated.\n\
+- HANDLES EVERY TEXT FILE — XML, JSON, YAML, gradle, plist, configs, dotfiles — not just the parsed \
+languages. Do NOT treat a non-code file as out of scope.\n\
+- STAYS FRESH AUTOMATICALLY — your edits are instant, and files created OUTSIDE vyer (a scaffolder like \
+`flutter create`, a `git checkout`, another tool) are picked up within a moment. You never need to reindex.\n\
+- AFTER RUNNING A BUILD OR TESTS — paste the compiler/test/stack-trace output into `code` with \
+mode=diagnose to jump straight to the exact failing code (enclosing symbol + the marked line), instead \
+of hand-reading each file:line.\n\
+- WORK IN BATCHES — many queries in one `code` call, many edits in one `code_apply` (all-or-nothing).\n\
+- Read `vyer://project` for the repo's real build/test/run/lint commands, `vyer://playbook` for recipes, \
+`vyer://repo-map` to orient.\n\
+- Fall back to native tools ONLY for: a path OUTSIDE this repo, a binary/non-text file, or running a shell command.\n\
 {VYER_BLOCK_END}"
     )
 }
@@ -384,6 +397,12 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn cmd_project(args: &[String]) -> Result<(), String> {
+    let engine = build_engine(args)?;
+    print!("{}", engine.project_info());
+    Ok(())
+}
+
 /// Exercise the deterministic apply path from the CLI. Safe by default: it
 /// dry-runs (validates + shows the unified diff) unless `--write` is passed.
 /// The new body comes from `--body-file` or stdin.
@@ -513,7 +532,7 @@ mod tests {
         // 1. empty/new file → just the block.
         let created = upsert_managed_block("", &block);
         assert!(created.contains(VYER_BLOCK_BEGIN) && created.contains(VYER_BLOCK_END));
-        assert!(created.contains("prefer Vyer MCP"));
+        assert!(created.contains("mcp__vyer__code"));
 
         // 2. existing user content → block APPENDED, user content preserved verbatim.
         let user = "# My project\n\nSome notes.\n";
@@ -539,7 +558,7 @@ mod tests {
             !refreshed.contains("OLD GUIDANCE"),
             "stale block must be replaced"
         );
-        assert!(refreshed.contains("prefer Vyer MCP"));
+        assert!(refreshed.contains("mcp__vyer__code"));
         assert_eq!(refreshed.matches(VYER_BLOCK_BEGIN).count(), 1);
     }
 }

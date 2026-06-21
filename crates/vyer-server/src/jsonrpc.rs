@@ -101,6 +101,7 @@ fn tool_text(text: String, is_error: bool) -> Value {
 
 pub const REPO_MAP_URI: &str = "vyer://repo-map";
 pub const STATUS_URI: &str = "vyer://status";
+pub const PROJECT_URI: &str = "vyer://project";
 pub const PLAYBOOK_URI: &str = "vyer://playbook";
 /// The agent usage playbook, embedded so it's served over MCP — documentation
 /// for the mcp, accessible THROUGH the mcp, no filesystem read needed.
@@ -121,6 +122,12 @@ fn resource_list() -> Value {
             "mimeType": "text/plain"
         },
         {
+            "uri": PROJECT_URI,
+            "name": "project",
+            "description": "Detected stack(s) + the real build/test/run/lint commands (from the manifests) — what to run in your shell. Vyer doesn't run them; it tells you what to.",
+            "mimeType": "text/plain"
+        },
+        {
             "uri": PLAYBOOK_URI,
             "name": "playbook",
             "description": "Agent usage playbook: intent → optimal `code`/`code_apply` call for orient/find/understand/refactor/edit/efficiency tasks.",
@@ -134,6 +141,7 @@ fn read_resource(engine: &Arc<Engine>, params: &Value) -> Result<Value, (i64, St
     let text = match uri {
         REPO_MAP_URI => engine.repo_map(8000),
         STATUS_URI => engine.status(),
+        PROJECT_URI => engine.project_info(),
         PLAYBOOK_URI => PLAYBOOK.to_string(),
         other => return Err((-32602, format!("unknown resource: {other}"))),
     };

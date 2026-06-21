@@ -460,6 +460,15 @@ impl Engine {
             summary_q.push(format!("{}({}/{})", query.q, query.mode, query.detail));
             marks.push(spans.len());
 
+            // SUPERPOWER (SCRY-116): `mode=diagnose` — paste a compiler/test/stack-trace blob into
+            // `q` → the exact code it references (enclosing symbol + a window with the failing line
+            // marked `>>`), best-at-the-edges, root cause first. Checked FIRST so it's robust to any
+            // `detail`. Closes the run → error → fix loop; the agent stops hand-grepping file:line.
+            if query.mode == "diagnose" {
+                spans.extend(self.diagnose_spans(&db, query));
+                continue;
+            }
+
             // `refs` (graph) is its own path: resolve definition(s) + approximate
             // cross-file references. We have no LSP yet, so the resolution is a
             // tree-sitter/lexical approximation and is HONESTLY reported as
@@ -1291,6 +1300,75 @@ impl Engine {
             text: body,
             score: 1.0,
         }]
+    }
+
+    /// SCRY-116: `mode=diagnose` — map a compiler/test/stack-trace blob (`q`) to the exact
+    /// code it references: the enclosing symbol's locator + a short window with the failing
+    /// line marked `>>`. The first reference scores highest (root cause → attention edge).
+    fn diagnose_spans(&self, db: &Db, q: &Query) -> Vec<budget::Span> {
+        let refs = parse_diagnostics(&q.q);
+        if refs.is_empty() {
+            return vec![budget::Span {
+                id: "diagnose".into(),
+                text: "no `file:line` locations found — pass the compiler/test output or a stack \
+                       trace as `q` (mode=diagnose)\n"
+                    .into(),
+                score: 1.0,
+            }];
+        }
+        let n = refs.len() as f64;
+        let mut spans = Vec::new();
+        for (i, (path, line)) in refs.into_iter().enumerate() {
+            let score = 1.0 - (i as f64) / (n + 1.0);
+            let resolved = match self.resolve_indexed_path(db, &path) {
+                Some(r) => r,
+                None => {
+                    spans.push(budget::Span {
+                        id: format!("{path}@L{line}"),
+                        text: format!(
+                            "{path}:{line} — not in vyer's index (outside the repo, gitignored, \
+                             generated, or a dependency); read it with native tools\n"
+                        ),
+                        score,
+                    });
+                    continue;
+                }
+            };
+            let text = match db.text(&resolved) {
+                Some(t) => t,
+                None => continue,
+            };
+            let idx = db.line_index(&resolved);
+            let total = idx.len().max(1) as u32;
+            let line = line.clamp(1, total);
+            let syms = db.symbols(&resolved);
+            let (sym, s_start, s_end) = enclosing(&syms, line);
+            let lo = line.saturating_sub(2).max(1);
+            let hi = (line + 2).min(total);
+            let mut body = String::new();
+            for ln in lo..=hi {
+                let off = idx[(ln - 1) as usize] as usize;
+                let end = idx
+                    .get(ln as usize)
+                    .map(|o| *o as usize)
+                    .unwrap_or(text.len());
+                let content = text[off..end].trim_end_matches('\n');
+                body.push_str(&format!(
+                    "{} {ln}: {content}\n",
+                    if ln == line { ">>" } else { "  " }
+                ));
+            }
+            let id = match &sym {
+                Some(name) => make_id(&resolved, Some(name), s_start, s_end, &text),
+                None => make_id(&resolved, None, line, line, &text),
+            };
+            spans.push(budget::Span {
+                id,
+                text: body,
+                score,
+            });
+        }
+        spans
     }
 
     /// `detail=count` — the grep -c / wc -l replacement, as one summary span.
@@ -3206,6 +3284,128 @@ impl Engine {
     }
 
     /// Server status as the `vyer://status` MCP Resource.
+    /// SCRY-117: `vyer://project` — what an agent needs to *operate* the repo: the detected
+    /// stack(s) and the real build/test/run/lint commands, parsed from the root manifests. Vyer
+    /// never runs them (the host's shell does) — this tells the agent WHAT to run; it then pastes
+    /// the output back into `mode=diagnose` to jump to the failures. Dynamic strings (npm script
+    /// names, make targets) are envelope-sanitized (Rule §8).
+    pub fn project_info(&self) -> String {
+        let root = &self.config.root;
+        let read = |name: &str| std::fs::read_to_string(root.join(name)).ok();
+        let exists = |name: &str| root.join(name).exists();
+        let mut out = String::from("\u{27E6}vyer/project v1\u{27E7}\n");
+        let mut found = false;
+
+        if exists("Cargo.toml") {
+            found = true;
+            out.push_str(
+                "rust (cargo): build `cargo build` \u{b7} test `cargo test` \u{b7} run `cargo run` \
+                 \u{b7} lint `cargo clippy` \u{b7} fmt `cargo fmt`\n",
+            );
+        }
+        if let Some(pkg) = read("package.json") {
+            found = true;
+            let pm = if exists("pnpm-lock.yaml") {
+                "pnpm"
+            } else if exists("yarn.lock") {
+                "yarn"
+            } else if exists("bun.lockb") {
+                "bun"
+            } else {
+                "npm"
+            };
+            out.push_str(&format!("node ({pm}): install `{pm} install`"));
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&pkg) {
+                if let Some(scripts) = v.get("scripts").and_then(|s| s.as_object()) {
+                    let run = if pm == "npm" { "npm run" } else { pm };
+                    let names: Vec<String> = scripts
+                        .keys()
+                        .take(14)
+                        .map(|k| format!("`{run} {}`", output::sanitize_field(k)))
+                        .collect();
+                    if !names.is_empty() {
+                        out.push_str(&format!(" \u{b7} scripts: {}", names.join(" \u{b7} ")));
+                    }
+                }
+            }
+            out.push('\n');
+        }
+        if let Some(spec) = read("pubspec.yaml") {
+            found = true;
+            let t = if spec.contains("sdk: flutter") || spec.contains("\nflutter:") {
+                "flutter"
+            } else {
+                "dart"
+            };
+            out.push_str(&format!(
+                "dart ({t}): deps `{t} pub get` \u{b7} run `{t} run` \u{b7} test `{t} test` \
+                 \u{b7} analyze `dart analyze` \u{b7} fmt `dart format .`\n"
+            ));
+        }
+        if exists("go.mod") {
+            found = true;
+            out.push_str(
+                "go: build `go build ./...` \u{b7} test `go test ./...` \u{b7} run `go run .` \
+                 \u{b7} vet `go vet ./...`\n",
+            );
+        }
+        if exists("pyproject.toml") || exists("setup.py") || exists("requirements.txt") {
+            found = true;
+            out.push_str(
+                "python: test `pytest` \u{b7} install `pip install -e .` or \
+                 `pip install -r requirements.txt`\n",
+            );
+        }
+        if exists("pom.xml") {
+            found = true;
+            out.push_str("java (maven): build `mvn package` \u{b7} test `mvn test`\n");
+        }
+        if exists("build.gradle") || exists("build.gradle.kts") {
+            found = true;
+            out.push_str("jvm (gradle): build `./gradlew build` \u{b7} test `./gradlew test`\n");
+        }
+        if exists("Gemfile") {
+            found = true;
+            out.push_str(
+                "ruby: install `bundle install` \u{b7} test `bundle exec rake` (or `rspec`)\n",
+            );
+        }
+        if let Some(mk) = read("Makefile") {
+            let targets: Vec<String> = mk
+                .lines()
+                .filter(|l| !l.starts_with(' ') && !l.starts_with('\t') && l.contains(':'))
+                .filter_map(|l| {
+                    let name = l[..l.find(':').unwrap()].trim();
+                    if !name.is_empty()
+                        && !name.starts_with('.')
+                        && name
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+                    {
+                        Some(format!("`make {}`", output::sanitize_field(name)))
+                    } else {
+                        None
+                    }
+                })
+                .take(14)
+                .collect();
+            if !targets.is_empty() {
+                found = true;
+                out.push_str(&format!("make: {}\n", targets.join(" \u{b7} ")));
+            }
+        }
+
+        if found {
+            out.push_str(
+                "\nVyer does NOT run these \u{2014} your host's shell does. After running a build or \
+                 tests, paste the output into `code` with mode=diagnose to jump to the failures.\n",
+            );
+        } else {
+            out.push_str("no recognized build manifest at the repo root \u{2014} inspect with detail=tree.\n");
+        }
+        out
+    }
+
     pub fn status(&self) -> String {
         // SCRY-092: surface files SKIPPED at index time for exceeding max_file_bytes
         // so the agent learns a large file exists but is unindexed (honest
@@ -4706,6 +4906,75 @@ fn enclosing(syms: &vyer_incr::SymbolTable, line: u32) -> (Option<String>, u32, 
     }
 }
 
+/// SCRY-116: extract (path, 1-based line) references from a compiler / test / stack-trace
+/// blob across the common toolchain formats — deterministic, dependency-free:
+///   `src/a.rs:42:10` · `lib/a.dart:42:5` · `./a.go:42` · `a.ts(42,10)` ·
+///   `File "a.py", line 42` · `at f (src/a.js:42:10)`
+/// Deduped, in first-seen order (the first reference is usually the root cause).
+fn parse_diagnostics(blob: &str) -> Vec<(String, u32)> {
+    fn looks_like_path(p: &str) -> bool {
+        !p.is_empty() && (p.contains('/') || p.contains('\\') || p.contains('.'))
+    }
+    fn push(out: &mut Vec<(String, u32)>, path: &str, line: u32) {
+        let path = path.trim_matches(|c: char| ",;: \t".contains(c));
+        if line == 0 || !looks_like_path(path) {
+            return;
+        }
+        if !out.iter().any(|(p, l)| p == path && *l == line) {
+            out.push((path.to_string(), line));
+        }
+    }
+    fn alldigit(s: &str) -> bool {
+        !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+    }
+    let mut out: Vec<(String, u32)> = Vec::new();
+    for raw in blob.lines() {
+        // Python: File "path", line N
+        if let Some(fi) = raw.find("File \"") {
+            let rest = &raw[fi + 6..];
+            if let Some(qend) = rest.find('"') {
+                let path = &rest[..qend];
+                if let Some(li) = rest[qend..].find("line ") {
+                    let after = &rest[qend + li + 5..];
+                    let num: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+                    if let Ok(n) = num.parse() {
+                        push(&mut out, path, n);
+                    }
+                }
+            }
+        }
+        // path:line[:col] — tokenized on whitespace + brackets/quotes (catches `(a.js:42:10)`).
+        // Trim a trailing `:`/`,` so the GCC/Dart `path:line:col:` form (trailing colon) and
+        // `path:line,` still right-split cleanly.
+        for tok in raw.split(|c: char| c.is_whitespace() || "()[]{}'\"`<>".contains(c)) {
+            let tok = tok.trim_end_matches(|c: char| c == ':' || c == ',');
+            let parts: Vec<&str> = tok.rsplitn(3, ':').collect();
+            if parts.len() == 3 && alldigit(parts[0]) && alldigit(parts[1]) {
+                push(&mut out, parts[2], parts[1].parse().unwrap_or(0));
+            } else if parts.len() == 2 && alldigit(parts[0]) {
+                push(&mut out, parts[1], parts[0].parse().unwrap_or(0));
+            }
+        }
+        // path(line[,col]) — tsc / C# / msbuild.
+        let mut search = 0;
+        while let Some(rel) = raw[search..].find('(') {
+            let open = search + rel;
+            let after = &raw[open + 1..];
+            let num: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if !num.is_empty() && matches!(after.as_bytes().get(num.len()), Some(b',') | Some(b')'))
+            {
+                let path = raw[..open]
+                    .rsplit(|c: char| c.is_whitespace())
+                    .next()
+                    .unwrap_or("");
+                push(&mut out, path, num.parse().unwrap_or(0));
+            }
+            search = open + 1;
+        }
+    }
+    out
+}
+
 fn make_id(path: &str, symbol: Option<&str>, start: u32, end: u32, text: &str) -> String {
     let loc = Locator {
         path: path.to_string(),
@@ -5381,6 +5650,87 @@ mod tests {
             out5.contains("run \"foo\" here"),
             "raw-string text must be untouched: {out5:?}"
         );
+    }
+
+    #[test]
+    fn parse_diagnostics_covers_common_formats() {
+        let blob = "error[E0308]: mismatched types\n  --> src/a.rs:42:5\n\
+                    lib/b.dart:7:3: Error: x\n\
+                    app/c.ts(9,2): error TS1\n\
+                    File \"scripts/d.py\", line 11, in f\n\
+                    \x20   at g (src/e.js:3:8)\n\
+                    ./f.go:4: undefined\n\
+                    see https://example.com:443/x for more\n";
+        let refs = parse_diagnostics(blob);
+        let has = |p: &str, l: u32| refs.iter().any(|(rp, rl)| rp == p && *rl == l);
+        assert!(has("src/a.rs", 42), "rust :col: {refs:?}");
+        assert!(has("lib/b.dart", 7), "dart trailing-colon: {refs:?}");
+        assert!(has("app/c.ts", 9), "tsc paren: {refs:?}");
+        assert!(has("scripts/d.py", 11), "python: {refs:?}");
+        assert!(has("src/e.js", 3), "js stack: {refs:?}");
+        assert!(has("./f.go", 4), "go: {refs:?}");
+        // a URL (host:port) must NOT be mistaken for a path:line ref.
+        assert!(
+            !refs.iter().any(|(p, _)| p.contains("example.com")),
+            "URL leaked as a ref: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn diagnose_mode_maps_errors_to_code() {
+        let engine = engine_with(&[("src/a.rs", "fn run() {\n    bad();\n}\n")]);
+        let req = CodeRequest {
+            queries: vec![Query {
+                q: "error[E0425]: cannot find value `bad`\n  --> src/a.rs:2:5".into(),
+                mode: "diagnose".into(),
+                ..base_query()
+            }],
+            budget_tokens: 8000,
+            exclude_seen: false,
+        };
+        let out = engine.code(&req);
+        assert!(
+            out.contains("src/a.rs#run"),
+            "should locate the enclosing symbol: {out}"
+        );
+        assert!(out.contains(">> 2:"), "should mark the failing line: {out}");
+    }
+
+    #[test]
+    fn project_info_detects_stacks_and_commands() {
+        let dir = std::env::temp_dir().join(format!("vyer_proj_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("pubspec.yaml"),
+            "name: x\ndependencies:\n  flutter:\n    sdk: flutter\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("package.json"),
+            "{\"scripts\":{\"test\":\"jest\",\"build\":\"tsc\"}}",
+        )
+        .unwrap();
+        std::fs::write(dir.join("Makefile"), "build:\n\tgo build\n.PHONY: build\n").unwrap();
+        let engine = Engine {
+            config: EngineConfig::new(dir.clone()),
+            db: Mutex::new(Db::new()),
+            seen: Mutex::new(HashSet::new()),
+            audit: Mutex::new(Vec::new()),
+            token_index: Mutex::new(None),
+            semantic_index: Mutex::new(None),
+            history: Mutex::new(Vec::new()),
+        };
+        let info = engine.project_info();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(info.contains("dart (flutter)"), "flutter: {info}");
+        assert!(info.contains("scripts:"), "node scripts: {info}");
+        assert!(info.contains("make build"), "make target: {info}");
+        assert!(
+            !info.contains(".PHONY"),
+            "make directive must be skipped: {info}"
+        );
+        assert!(info.contains("mode=diagnose"), "bridge to diagnose: {info}");
     }
 
     fn base_query() -> Query {
