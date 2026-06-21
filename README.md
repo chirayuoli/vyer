@@ -116,7 +116,7 @@ change — done fast, safe, and local:
 | **npm** (just needs Node) | `npm install -g @0x1labs/vyer` |
 | **Homebrew** | `brew install chirayuoli/tap/vyer` |
 | **Prebuilt binary** | grab it from [Releases](https://github.com/chirayuoli/vyer/releases) (macOS / Linux / Windows) |
-| **From source** | `cargo install --git https://github.com/chirayuoli/vyer vyer-server` |
+| **From source** (Rust 1.85+) | `cargo install --git https://github.com/chirayuoli/vyer vyer-server` |
 
 > You don't run `vyer serve` by hand — it's an MCP server your agent host launches (step 2). With the
 > npm config below you don't even need to install anything; `npx` fetches it on demand.

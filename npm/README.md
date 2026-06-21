@@ -75,7 +75,7 @@ Quickstart, the agent playbook, security model, and benchmarks all live in the r
 
 ### → **https://github.com/chirayuoli/vyer**
 
-No prebuilt binary for your platform? Build from source:
+No prebuilt binary for your platform? Build from source (needs Rust 1.85+):
 `cargo install --git https://github.com/chirayuoli/vyer vyer-server`
 
 <div align="center"><sub>MIT OR Apache-2.0 · built by <a href="https://www.npmjs.com/org/0x1labs">0x1labs</a></sub></div>
