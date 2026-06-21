@@ -4947,7 +4947,7 @@ fn parse_diagnostics(blob: &str) -> Vec<(String, u32)> {
         // Trim a trailing `:`/`,` so the GCC/Dart `path:line:col:` form (trailing colon) and
         // `path:line,` still right-split cleanly.
         for tok in raw.split(|c: char| c.is_whitespace() || "()[]{}'\"`<>".contains(c)) {
-            let tok = tok.trim_end_matches(|c: char| c == ':' || c == ',');
+            let tok = tok.trim_end_matches([':', ',']);
             let parts: Vec<&str> = tok.rsplitn(3, ':').collect();
             if parts.len() == 3 && alldigit(parts[0]) && alldigit(parts[1]) {
                 push(&mut out, parts[2], parts[1].parse().unwrap_or(0));
