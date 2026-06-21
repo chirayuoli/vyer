@@ -1734,15 +1734,26 @@ impl Engine {
         // is taken as the symbol name and resolves to nothing (false "0 refs").
         let (qpath, name) = parse_symbol_query(&q.q);
         let name = name.as_str();
-        let files = self.scoped_files(db, q);
-        // A path qualifier, when it resolves, pins the DEFINITION to that file
-        // (disambiguating a name defined in several files/languages); references
-        // are still gathered repo-wide by name below.
-        let def_files: Vec<String> = match qpath
+        let mut files = self.scoped_files(db, q);
+        let resolved_def = qpath
             .as_deref()
-            .and_then(|p| self.resolve_indexed_path(db, p))
-        {
-            Some(r) => vec![r],
+            .and_then(|p| self.resolve_indexed_path(db, p));
+        // SCRY-126: a qualified `PATH#SYMBOL` scopes refs to the definition's
+        // PACKAGE (nearest ancestor with a manifest), so a same-named symbol in
+        // another monorepo package isn't conflated — the precision a bare name
+        // can't give. graph stays lexical-approx WITHIN that package.
+        let mut scope_note = String::new();
+        if let Some(r) = &resolved_def {
+            if let Some(pkg) = package_root(&files, r).filter(|p| !p.is_empty()) {
+                let pref = format!("{pkg}/");
+                files.retain(|f| f.starts_with(&pref));
+                scope_note = format!(" scope=package({pkg})");
+            }
+        }
+        // The definition is pinned to the qualified file when given; references are
+        // gathered across the (now package-scoped) file set by name below.
+        let def_files: Vec<String> = match &resolved_def {
+            Some(r) => vec![r.clone()],
             None => files.clone(),
         };
 
@@ -1804,7 +1815,7 @@ impl Engine {
         let cap = q.k.max(1) * 6;
         let shown = refs.len().min(cap);
         let mut body = format!(
-            "references to `{name}`: defs={} refs={} (showing {}) graph=partial(approx) tier=lexical-approx\n",
+            "references to `{name}`: defs={} refs={} (showing {}) graph=partial(approx) tier=lexical-approx{scope_note}\n",
             defs.len(),
             refs.len(),
             shown
@@ -1830,8 +1841,21 @@ impl Engine {
         // SCRY-119: accept a fully-qualified `PATH#SYMBOL` locator, not just a bare
         // name — otherwise impact treats the whole locator as the name, finds no
         // referrers, and dangerously reports "safe to change in isolation".
-        let (_qpath, target) = parse_symbol_query(&q.q);
-        let files = self.scoped_files(db, q);
+        let (qpath, target) = parse_symbol_query(&q.q);
+        let mut files = self.scoped_files(db, q);
+        // SCRY-126: a qualified locator scopes the blast radius to the definition's
+        // package, so impact doesn't conflate a same-named symbol elsewhere.
+        let mut scope_note = String::new();
+        if let Some(r) = qpath
+            .as_deref()
+            .and_then(|p| self.resolve_indexed_path(db, p))
+        {
+            if let Some(pkg) = package_root(&files, &r).filter(|p| !p.is_empty()) {
+                let pref = format!("{pkg}/");
+                files.retain(|f| f.starts_with(&pref));
+                scope_note = format!(" scope=package({pkg})");
+            }
+        }
 
         // One pass: collect every symbol and build an inverted index
         // `referrers[name] = symbol indices whose body mentions `name``. BFS then
@@ -1897,7 +1921,7 @@ impl Engine {
         // over-reported, lexical-approx) ripple. Surface both.
         let direct = impacted.iter().filter(|(_, d)| *d == 1).count();
         let mut body = format!(
-            "impact of `{target}`: {direct} direct + {} transitive referrer(s) ({total} total) graph=partial(approx) tier=lexical-approx\n",
+            "impact of `{target}`: {direct} direct + {} transitive referrer(s) ({total} total) graph=partial(approx) tier=lexical-approx{scope_note}\n",
             total.saturating_sub(direct)
         );
         if total == 0 {
@@ -2848,6 +2872,26 @@ impl Engine {
                         vyer_incr::Lang::Generic => vyer_incr::detect_lang(&path),
                         l => l,
                     };
+                    // SCRY-126: if `old` is DEFINED in more than one file of this
+                    // language (a duplicated name across monorepo packages) and no
+                    // path_scope was given, a repo-wide rename would corrupt the OTHER
+                    // package's same-named symbol. Confine to the definition's package
+                    // (nearest ancestor with a manifest). path_scope overrides.
+                    let auto_pkg: Option<String> = if e.path_scope.is_empty() {
+                        let defs = db
+                            .files()
+                            .into_iter()
+                            .filter(|f| same_lang_family(db.lang(f), def_lang))
+                            .filter(|f| db.symbols(f).symbols.iter().any(|s| s.name == old))
+                            .count();
+                        if defs > 1 {
+                            package_root(&db.files(), &path).filter(|p| !p.is_empty())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
                     for f in db.files() {
                         if !e.path_scope.is_empty() && !path_in_scope(&f, &e.path_scope) {
                             continue;
@@ -2856,6 +2900,12 @@ impl Engine {
                         // family (a same-named symbol elsewhere is a different symbol).
                         if !same_lang_family(db.lang(&f), def_lang) {
                             continue;
+                        }
+                        // SCRY-126: ambiguous name — confine to the def's package.
+                        if let Some(pkg) = &auto_pkg {
+                            if !f.starts_with(&format!("{pkg}/")) {
+                                continue;
+                            }
                         }
                         let text = match db.text(&f) {
                             Some(t) => t,
@@ -2885,6 +2935,11 @@ impl Engine {
                         "rename `{old}` → `{newname}`: {total} occurrence(s) across {} file(s)\n",
                         changes.len()
                     ));
+                    if let Some(pkg) = &auto_pkg {
+                        report.push_str(&format!(
+                            "note: `{old}` is defined in multiple packages; confined to `{pkg}/` (pass path_scope to widen or pick another package)\n"
+                        ));
+                    }
                     for (f, _, _, n) in &changes {
                         report.push_str(&format!("  {f}: {n}\n"));
                     }
@@ -5411,6 +5466,51 @@ fn cap_diff(diff: &str, max_lines: usize) -> String {
         "{head}\n… +{} more diff lines (read the file or narrow with q=path)",
         total - max_lines
     )
+}
+
+/// Package/build manifests that mark a directory as a project root (SCRY-126).
+const PKG_MANIFESTS: &[&str] = &[
+    "package.json",
+    "Cargo.toml",
+    "go.mod",
+    "pyproject.toml",
+    "setup.py",
+    "setup.cfg",
+    "build.gradle",
+    "build.gradle.kts",
+    "pom.xml",
+    "pubspec.yaml",
+    "Gemfile",
+];
+
+/// SCRY-126: the nearest ancestor directory of `file` that holds a package
+/// manifest (the package boundary), searched among the indexed `files`. Returns
+/// the directory prefix (e.g. `packages/cli`), `""` when only the repo root has a
+/// manifest, or `None` if none is found. Used to confine an ambiguous rename and
+/// to scope a qualified-locator refs/impact to one package.
+fn package_root(files: &[String], file: &str) -> Option<String> {
+    let mut dir = file;
+    loop {
+        let parent = match dir.rfind('/') {
+            Some(i) => &dir[..i],
+            None => "",
+        };
+        let has_manifest = PKG_MANIFESTS.iter().any(|m| {
+            let cand = if parent.is_empty() {
+                m.to_string()
+            } else {
+                format!("{parent}/{m}")
+            };
+            files.iter().any(|f| f == &cand)
+        });
+        if has_manifest {
+            return Some(parent.to_string());
+        }
+        if parent.is_empty() {
+            return None;
+        }
+        dir = parent;
+    }
 }
 
 /// Short content hash for staleness detection in the locator. (blake3 in the

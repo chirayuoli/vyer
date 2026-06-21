@@ -443,6 +443,84 @@ fn end_directive_with_symbol_is_rejected_with_guidance() {
 }
 
 #[test]
+fn rename_confines_to_package_when_symbol_is_ambiguous() {
+    // SCRY-126 (B2): a name defined in TWO monorepo packages must not be renamed
+    // repo-wide — confine to the definition's package, leaving the other intact.
+    let (_d, root) = fixture();
+    std::fs::create_dir_all(root.join("packages/cli/src")).unwrap();
+    std::fs::create_dir_all(root.join("packages/core/src")).unwrap();
+    std::fs::write(root.join("packages/cli/package.json"), "{}\n").unwrap();
+    std::fs::write(root.join("packages/core/package.json"), "{}\n").unwrap();
+    std::fs::write(
+        root.join("packages/cli/src/config.ts"),
+        "export class Config {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("packages/core/src/config.ts"),
+        "export class Config {}\n",
+    )
+    .unwrap();
+    let eng = engine(&root, true);
+    let out = eng
+        .code_apply(&rename_req("packages/cli/src/config.ts#Config", "Settings"))
+        .unwrap();
+    assert!(
+        out.contains("packages/cli/src/config.ts"),
+        "cli def must be renamed: {out}"
+    );
+    assert!(
+        !out.contains("packages/core"),
+        "the other package's Config must NOT be touched: {out}"
+    );
+    let core = eng.code(&read("packages/core/src/config.ts", "full"));
+    assert!(
+        core.contains("class Config"),
+        "core Config must survive: {core}"
+    );
+}
+
+#[test]
+fn qualified_refs_scope_to_the_definitions_package() {
+    // SCRY-126 (B1): refs on a qualified locator scope to the definition's package,
+    // not a global bare-name fallback that conflates another package's same name.
+    let (_d, root) = fixture();
+    std::fs::create_dir_all(root.join("packages/cli/src")).unwrap();
+    std::fs::create_dir_all(root.join("packages/core/src")).unwrap();
+    std::fs::write(root.join("packages/cli/package.json"), "{}\n").unwrap();
+    std::fs::write(root.join("packages/core/package.json"), "{}\n").unwrap();
+    std::fs::write(
+        root.join("packages/cli/src/config.ts"),
+        "export class Config {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("packages/cli/src/use.ts"),
+        "import { Config } from './config';\nconst a: Config = new Config();\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("packages/core/src/config.ts"),
+        "export class Config {}\nconst b: Config = new Config();\n",
+    )
+    .unwrap();
+    let eng = engine(&root, false);
+    let refs = eng.code(&one("packages/cli/src/config.ts#Config", "graph", "refs"));
+    assert!(
+        refs.contains("packages/cli/src/use.ts"),
+        "the cli-package reference must be found: {refs}"
+    );
+    assert!(
+        !refs.contains("packages/core"),
+        "the other package must be excluded: {refs}"
+    );
+    assert!(
+        refs.contains("scope=package(packages/cli)"),
+        "should report the package scope: {refs}"
+    );
+}
+
+#[test]
 fn apply_delete_file_removes_it() {
     let (_d, root) = fixture();
     let eng = engine(&root, true);
