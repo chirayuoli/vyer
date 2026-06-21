@@ -1,0 +1,43 @@
+[package]
+name = "vyer-server"
+version = "0.1.0"
+edition = "2021"
+description = "Secure MCP front end + CLI for Vyer, the local-first code-context engine. Exposes one `code` tool (lexical+structural search, compact UNTRUSTED output, freshness) and a gated, sandboxed `code_apply`."
+
+[[bin]]
+name = "vyer"
+path = "src/main.rs"
+
+[lib]
+name = "vyer_server"
+path = "src/lib.rs"
+
+[dependencies]
+vyer-core = { path = "../vyer-core" }
+vyer-incr = { path = "../vyer-incr" }
+vyer-index = { path = "../vyer-index" }
+
+# Lexical search at the library level — ripgrep's own crates, never shelling out.
+ignore = "0.4"
+grep-searcher = "0.1"
+grep-regex = "0.1"
+grep-matcher = "0.1"
+# SIMD substring search (memmem) for the literal count fast-path, and the
+# Aho-Corasick automaton for single-pass multi-literal boolean matching. Both
+# are already in the lock tree transitively via the grep-* crates above, so
+# promoting them to direct deps adds no new downloads.
+memchr = "2.8"
+aho-corasick = "1.1"
+
+# MCP transport (official Rust SDK) + async runtime, used only at the edge.
+rmcp = { version = "0.16", features = ["server", "transport-io", "macros", "schemars"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1"
+
+# FS watching so edits made outside code_apply become query-ready.
+notify = "6"
+
+[dev-dependencies]
+tempfile = "3"
