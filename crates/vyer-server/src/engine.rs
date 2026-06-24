@@ -4406,9 +4406,22 @@ impl Engine {
                 if skipped.len() > 20 { ", …" } else { "" },
             )
         };
+        // SCRY-141: surface the code_run allowlist so the agent discovers task NAMES
+        // (for `code_apply {"run":"<name>"}`) without probing with an unknown task.
+        let run_line = if !self.config.allow_run {
+            "run=disabled (start with --allow-run)".to_string()
+        } else if self.config.run_tasks.is_empty() {
+            "run=enabled but no tasks (register via --run name=\"cmd\")".to_string()
+        } else {
+            let names: Vec<&str> = self.config.run_tasks.keys().map(String::as_str).collect();
+            format!(
+                "run=enabled tasks=[{}] — call code_apply {{\"run\":\"<name>\"}}",
+                names.join(", ")
+            )
+        };
         let db = self.db.lock().unwrap();
         format!(
-            "\u{27E6}vyer/status v1\u{27E7}\nroot={}\nindexed_files={}\nrevision={}\nwrites={}\nparser=tree-sitter\nlexical=ripgrep-libs\ngraph=partial(approx)\nsemantic=lexical-subword(tf-idf)\nast=tree-sitter-query\ncode.modes=auto|lexical|structural|graph|semantic|ast\ncode.detail=locate|outline|snippet|full|refs|impact|context|count|tree|diff|ast\ncode.filters=path_scope(globs,!exclude)|lang(csv)|all_of/any_of/none_of\napply.ops=new_body|anchor/replace(+word=scoped-local-rename)|rename|move_to|@after/@before/@into/@end/@new|@delete|undo\nverify={}\n{}\n",
+            "\u{27E6}vyer/status v1\u{27E7}\nroot={}\nindexed_files={}\nrevision={}\nwrites={}\nparser=tree-sitter\nlexical=ripgrep-libs\ngraph=partial(approx)\nsemantic=lexical-subword(tf-idf)\nast=tree-sitter-query\ncode.modes=auto|lexical|structural|graph|semantic|ast|diagnose\ncode.detail=locate|outline|snippet|full|refs|impact|context|count|tree|diff|ast|import|help\ncode.filters=path_scope(globs,!exclude)|lang(csv)|all_of/any_of/none_of\napply.ops=new_body|anchor/replace(+word=scoped-local-rename)|rename|move_to|@after/@before/@into/@end/@new|@delete|run|undo\nverify={}\n{}\n{}\n",
             self.config.root.display(),
             db.files().len(),
             db.revision(),
@@ -4417,6 +4430,7 @@ impl Engine {
                 Some(c) => c.join(" "),
                 None => "off".to_string(),
             },
+            run_line,
             skipped_line,
         )
     }
