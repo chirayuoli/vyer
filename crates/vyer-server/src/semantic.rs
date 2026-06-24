@@ -76,6 +76,7 @@ impl SemanticProvider for NullProvider {}
 /// running language server (the happy path needs the server binary; this doesn't).
 pub mod lsp {
     use serde_json::{json, Value};
+    use std::io::{Read, Write};
 
     /// Frame a JSON-RPC body for the LSP base protocol: a `Content-Length` header,
     /// CRLFCRLF, then the body. This is exactly what an LSP server reads on stdin.
@@ -143,9 +144,149 @@ pub mod lsp {
         Some(out)
     }
 
+    /// Read framed messages from `reader` until one is a JSON-RPC response whose
+    /// `id` is `want_id`, returning its body. Interleaved notifications / other ids
+    /// (log messages, progress, diagnostics a server emits during a request) are
+    /// skipped — the part naive clients get wrong. `None` on EOF/garbage/cap. The
+    /// `cap` bounds the buffer so a flood can't OOM us (Rule §8 robustness).
+    fn read_until_id<R: Read>(
+        reader: &mut R,
+        buf: &mut Vec<u8>,
+        want_id: i64,
+        cap: usize,
+    ) -> Option<String> {
+        loop {
+            while let Some((body, used)) = parse_frame(buf) {
+                buf.drain(..used);
+                if serde_json::from_str::<Value>(&body)
+                    .ok()
+                    .and_then(|v| v.get("id").and_then(Value::as_i64))
+                    == Some(want_id)
+                {
+                    return Some(body);
+                }
+                // else: a notification or a different id → skip, keep draining.
+            }
+            if buf.len() > cap {
+                return None;
+            }
+            let mut chunk = [0u8; 4096];
+            match reader.read(&mut chunk) {
+                Ok(0) => return None, // EOF without a matching response
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                Err(_) => return None,
+            }
+        }
+    }
+
+    /// Drive a full `textDocument/references` exchange over an already-connected
+    /// server (`reader`/`writer` = the server's stdout/stdin): initialize →
+    /// initialized → didOpen → references, skipping interleaved notifications, and
+    /// return type-resolved `(uri, 1-based line)` pairs. Generic over the streams so
+    /// it's unit-tested with in-memory mocks (no process, no hang); the process-spawn
+    /// wrapper (Phase 2c) just hands it a child's piped stdio + a read timeout. Any
+    /// protocol failure → `None`, so the engine degrades to its approximation (§8).
+    #[allow(clippy::too_many_arguments)]
+    pub fn drive_references<R: Read, W: Write>(
+        reader: &mut R,
+        writer: &mut W,
+        root_uri: &str,
+        file_uri: &str,
+        lang_id: &str,
+        text: &str,
+        line: u32,
+        character: u32,
+    ) -> Option<Vec<(String, u32)>> {
+        let init = json!({
+            "jsonrpc":"2.0","id":1,"method":"initialize",
+            "params":{"processId":null,"rootUri":root_uri,"capabilities":{}}
+        })
+        .to_string();
+        writer.write_all(&frame(&init)).ok()?;
+        let mut buf: Vec<u8> = Vec::new();
+        read_until_id(reader, &mut buf, 1, 1 << 20)?; // await the initialize result
+        for notif in [
+            json!({"jsonrpc":"2.0","method":"initialized","params":{}}).to_string(),
+            json!({
+                "jsonrpc":"2.0","method":"textDocument/didOpen",
+                "params":{"textDocument":{"uri":file_uri,"languageId":lang_id,"version":1,"text":text}}
+            })
+            .to_string(),
+        ] {
+            writer.write_all(&frame(&notif)).ok()?;
+        }
+        writer
+            .write_all(&frame(&references_request(2, file_uri, line, character)))
+            .ok()?;
+        writer.flush().ok()?;
+        let body = read_until_id(reader, &mut buf, 2, 4 << 20)?;
+        parse_references(&body, 2)
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn drive_references_handshakes_skips_notifications_and_parses() {
+            // a server that emits init result, an interleaved log notification (no id,
+            // must be skipped), then the references result.
+            let init_resp =
+                json!({"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}).to_string();
+            let log = json!({"jsonrpc":"2.0","method":"window/logMessage","params":{"message":"indexing"}}).to_string();
+            let refs_resp = json!({
+                "jsonrpc":"2.0","id":2,
+                "result":[{"uri":"file:///r/b.rs","range":{"start":{"line":4,"character":0}}}]
+            })
+            .to_string();
+            let mut server_out = Vec::new();
+            for m in [&init_resp, &log, &refs_resp] {
+                server_out.extend_from_slice(&frame(m));
+            }
+            let mut reader = std::io::Cursor::new(server_out);
+            let mut writer: Vec<u8> = Vec::new();
+            let refs = drive_references(
+                &mut reader,
+                &mut writer,
+                "file:///r",
+                "file:///r/a.rs",
+                "rust",
+                "fn a(){}",
+                0,
+                3,
+            )
+            .unwrap();
+            assert_eq!(refs, vec![("file:///r/b.rs".to_string(), 5)]); // 0-based → 1-based
+                                                                       // the client sent the full handshake, in order.
+            let sent = String::from_utf8(writer).unwrap();
+            for needle in [
+                "\"initialize\"",
+                "\"initialized\"",
+                "textDocument/didOpen",
+                "textDocument/references",
+            ] {
+                assert!(sent.contains(needle), "missing {needle} in: {sent}");
+            }
+        }
+
+        #[test]
+        fn drive_references_degrades_on_eof() {
+            // server closes after the init result, never answering references → None.
+            let init_resp = json!({"jsonrpc":"2.0","id":1,"result":{}}).to_string();
+            let mut reader = std::io::Cursor::new(frame(&init_resp));
+            let mut writer: Vec<u8> = Vec::new();
+            assert!(drive_references(
+                &mut reader,
+                &mut writer,
+                "file:///r",
+                "file:///r/a.rs",
+                "rust",
+                "",
+                0,
+                0
+            )
+            .is_none());
+        }
 
         #[test]
         fn frame_roundtrips_and_streams() {
