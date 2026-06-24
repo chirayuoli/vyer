@@ -100,8 +100,13 @@ fn cli_apply_rename_dry_run_and_undo_message() {
     );
 
     // @delete is body-less over the CLI (SCRY-051) — a diff/dry-run, not the
-    // "no new_body" error.
-    let del = vyer_apply(dir.path(), &["--locator", "lib.rs#@delete:old_name"]);
+    // "no new_body" error. `old_name` is still referenced, so the SCRY-134
+    // safe-delete guard would refuse it; `--force` is the documented override and
+    // exercises that flag end-to-end over the CLI.
+    let del = vyer_apply(
+        dir.path(),
+        &["--locator", "lib.rs#@delete:old_name", "--force"],
+    );
     assert!(
         !del.contains("no new_body"),
         "@delete must not demand a body over the CLI: {del}"

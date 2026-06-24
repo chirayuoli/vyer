@@ -261,6 +261,13 @@ pub struct Edit {
     /// Same glob syntax as `code`'s `path_scope`; a `!`-prefixed entry excludes.
     #[serde(default)]
     pub path_scope: Vec<String>,
+    /// SCRY-134 (guiding master): override a safety REFUSAL — e.g. deleting a
+    /// symbol that still has references. Default false: vyer refuses the unsafe
+    /// edit and tells you why (the reference sites), so a slip can't silently
+    /// break callers. Set `force:true` only after you've seen and accepted the
+    /// blast radius.
+    #[serde(default)]
+    pub force: bool,
 }
 
 /// Request for the `code_apply` tool. ACCEPTS MORE THAN THIS SCHEMA SHOWS
@@ -1990,6 +1997,43 @@ impl Engine {
     /// Without an LSP this is a tree-sitter (defs) + word-boundary lexical (refs)
     /// approximation, so every result is tagged `graph=partial(approx)` and the
     /// agent can calibrate. Emits one span per definition plus a references span.
+    /// SCRY-134 (guiding master): code references to `name` OUTSIDE its own
+    /// definition in `def_file` — the blast radius for the safe-delete guard.
+    /// Word-boundary, code-identifier-only (comments/strings excluded), pruned by a
+    /// cheap resident-text substring check. graph=partial(approx): a same-named
+    /// symbol elsewhere counts conservatively (better to refuse a delete than
+    /// silently break callers); `force:true` overrides.
+    fn external_refs(&self, db: &Db, name: &str, def_file: &str) -> Vec<(String, u32)> {
+        let pattern = format!(r"\b{}\b", regex_escape_ident(name));
+        let def_lines: Vec<u32> = db
+            .symbols(def_file)
+            .symbols
+            .iter()
+            .filter(|s| s.name == name)
+            .map(|s| s.start)
+            .collect();
+        let mut out: Vec<(String, u32)> = Vec::new();
+        for f in db.files() {
+            let text = match db.text(&f) {
+                Some(t) => t,
+                None => continue,
+            };
+            if !text.contains(name) {
+                continue; // cheap prune over resident text
+            }
+            let flang = vyer_incr::detect_lang(&f);
+            let code_lines = code_ident_lines(&text, name, flang);
+            for hit in lexical::search_text(&text, &pattern, 200) {
+                let is_own_def = f == def_file && def_lines.contains(&hit.line);
+                if is_own_def || !code_lines.contains(&hit.line) {
+                    continue;
+                }
+                out.push((f.clone(), hit.line));
+            }
+        }
+        out
+    }
+
     fn refs_spans(&self, db: &Db, q: &Query) -> Vec<budget::Span> {
         // SCRY-119: accept a fully-qualified `PATH#SYMBOL` locator (the playbook's
         // disambiguation form), not just a bare name — otherwise the whole locator
@@ -3069,6 +3113,47 @@ impl Engine {
                  `PATH#SYMBOL` (a symbol), `PATH` alone (file/module-level, e.g. for anchor/replace on imports), \
                  or an authoring directive like `PATH#@new` / `PATH#@after:SYMBOL`"
             ));
+        }
+
+        // SCRY-134 (guiding master): refuse to DELETE a symbol that still has
+        // references — the dead-code / break-callers mistake an agent makes when it
+        // reasons "this looks unused" without the graph. The warm ref graph KNOWS;
+        // surface the sites and refuse, overridable with force:true. Pre-flight
+        // (before any mutation) so the batch stays all-or-nothing.
+        for e in &req.edits {
+            if e.force {
+                continue;
+            }
+            let raw = e.locator.split(" :: ").next().unwrap_or(&e.locator).trim();
+            let Some((p, t)) = raw.split_once('#') else {
+                continue;
+            };
+            let Some(sym) = t.strip_prefix("@delete:") else {
+                continue;
+            };
+            let Some(def_file) = self.resolve_indexed_path(&db, p) else {
+                continue;
+            };
+            let refs = self.external_refs(&db, sym, &def_file);
+            if !refs.is_empty() {
+                let shown: Vec<String> = refs
+                    .iter()
+                    .take(8)
+                    .map(|(f, l)| format!("{f}:{l}"))
+                    .collect();
+                let more = refs.len().saturating_sub(shown.len());
+                let tail = if more > 0 {
+                    format!(", +{more} more")
+                } else {
+                    String::new()
+                };
+                return Err(format!(
+                    "refusing to delete `{sym}`: {} reference(s) still point to it (graph=partial/approx) — \
+                     update or remove the callers first, or pass force:true to delete anyway. sites: {}{tail}",
+                    refs.len(),
+                    shown.join(", ")
+                ));
+            }
         }
 
         let result: Result<String, String> = (|| {
@@ -5274,7 +5359,9 @@ EDIT — code_apply (gated by --allow-writes; NO prior Read needed; bytes never 
   insert before sym:  {\"locator\":\"src/a.rs#@before:Foo\",\"new_body\":\"…\"}
   create a file:      {\"locator\":\"src/new.rs#@new\",\"new_body\":\"…\"}
   rename repo-wide:   {\"locator\":\"src/a.rs#Old\",\"rename\":\"New\"}
-  also: word:true (scoped local rename), move_to, @after:/@end/@into:Container/@delete, undo:N.
+  also: word:true (scoped local rename), move_to, @after:/@end/@into:Container, undo:N.
+  safe-delete:        {\"locator\":\"src/a.rs#@delete:foo\"}  ← REFUSED if `foo` still has
+                      references (names the sites); pass \"force\":true to delete anyway.
   A locator from a result (PATH#SYM@Lrange :: blake3=…) pastes back verbatim; the blake3 is
   an OPTIMISTIC-CONCURRENCY precondition (rejected if the symbol changed since you read it).
 ";
@@ -7829,6 +7916,51 @@ mod tests {
         let err = engine.code_apply(&req).unwrap_err();
         assert!(err.contains("locator"), "{err}");
         assert!(err.contains("PATH#SYMBOL"), "explains the format: {err}");
+    }
+
+    #[test]
+    fn safe_delete_refuses_referenced_symbol() {
+        // SCRY-134 (guiding master): deleting a symbol that still has references is
+        // the dead-code/break-callers mistake; vyer refuses and names the sites.
+        let mut engine = engine_with(&[
+            ("src/a.rs", "pub fn helper() -> i32 {\n    1\n}\n"),
+            ("src/b.rs", "fn use_it() -> i32 {\n    helper()\n}\n"),
+        ]);
+        engine.config.allow_writes = true;
+        let del = |force: bool| ApplyRequest {
+            edits: vec![Edit {
+                locator: "src/a.rs#@delete:helper".into(),
+                force,
+                ..Default::default()
+            }],
+            dry_run: true,
+            undo: None,
+        };
+        let err = engine.code_apply(&del(false)).unwrap_err();
+        assert!(err.contains("refusing to delete `helper`"), "{err}");
+        assert!(err.contains("src/b.rs"), "names the reference site: {err}");
+        assert!(err.contains("force"), "offers the override: {err}");
+        // force:true bypasses the guard (whatever happens next, it's not the refusal).
+        let forced = engine.code_apply(&del(true));
+        assert!(
+            forced.is_ok() || !forced.unwrap_err().contains("refusing to delete"),
+            "force:true must override the safe-delete guard"
+        );
+        // an UNREFERENCED symbol deletes without a refusal.
+        let mut lone = engine_with(&[("src/c.rs", "fn dead() {}\n")]);
+        lone.config.allow_writes = true;
+        let out = lone.code_apply(&ApplyRequest {
+            edits: vec![Edit {
+                locator: "src/c.rs#@delete:dead".into(),
+                ..Default::default()
+            }],
+            dry_run: true,
+            undo: None,
+        });
+        assert!(
+            out.is_ok() || !out.unwrap_err().contains("refusing to delete"),
+            "unreferenced symbol must not be refused"
+        );
     }
 
     #[test]

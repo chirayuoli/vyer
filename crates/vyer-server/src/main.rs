@@ -468,6 +468,8 @@ fn cmd_apply(args: &[String]) -> Result<(), String> {
             word: has(args, "--word"),
             // SCRY-105: `--path-scope` globs confine a repo-wide rename (monorepo).
             path_scope: multi_flag(args, "--path-scope"),
+            // SCRY-134: override a safety refusal (e.g. deleting a referenced symbol).
+            force: has(args, "--force"),
         }],
         dry_run: !write,
         undo: None,
