@@ -37,7 +37,7 @@ serde_json = "1"
 schemars = "1"
 
 # FS watching so edits made outside code_apply become query-ready.
-notify = "6"
+notify = "8"
 
 [dev-dependencies]
 tempfile = "3"
