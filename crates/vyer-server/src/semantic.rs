@@ -69,6 +69,79 @@ pub struct NullProvider;
 
 impl SemanticProvider for NullProvider {}
 
+/// A real language-server-backed provider (Phase 2c): spawns an OPERATOR-configured
+/// server, drives a `textDocument/references` exchange via [`lsp::drive_references`]
+/// on a TIMEOUT-bounded worker thread (kill-on-timeout, so a hung/slow server can
+/// never block a query — Rule §8), and maps the resulting `file://` URIs back to
+/// repo-relative paths. The server command is operator-set (never request-supplied),
+/// same trust model as `verify_cmd`/`code_run` (Rule §3). Any failure → `None`, so
+/// the engine degrades to its lexical approximation.
+///
+/// Note (perf): this spawns per call, which is correct but slow for a real server's
+/// cold init — the long-lived-server pool is the next optimization (Phase 2d). The
+/// process I/O + timeout + degradation are CI-tested here; the happy path against a
+/// real server (rust-analyzer) is validated locally (CI has no server binary).
+pub struct LspProvider {
+    pub argv: Vec<String>,
+    pub root: std::path::PathBuf,
+    pub lang_id: String,
+    pub timeout: std::time::Duration,
+}
+
+impl LspProvider {
+    /// Type-resolved references to the symbol at `(line, character)` (0-based) in the
+    /// repo-relative `file_rel`. `None` on any failure → caller degrades.
+    pub fn references_at(
+        &self,
+        file_rel: &str,
+        line: u32,
+        character: u32,
+    ) -> Option<Vec<(String, u32)>> {
+        use std::process::{Command, Stdio};
+        let (prog, rest) = self.argv.split_first()?;
+        let mut child = Command::new(prog)
+            .args(rest)
+            .current_dir(&self.root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?; // spawn failure (no binary) → degrade
+        let mut stdin = child.stdin.take()?;
+        let mut stdout = child.stdout.take()?;
+        let root_disp = self.root.display().to_string();
+        let root_uri = format!("file://{root_disp}");
+        let file_uri = format!("file://{root_disp}/{file_rel}");
+        let text = std::fs::read_to_string(self.root.join(file_rel)).unwrap_or_default();
+        let lang = self.lang_id.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        // Drive the (blocking) exchange on a worker so the MAIN thread can enforce a
+        // hard timeout and kill a hung server — the query never blocks indefinitely.
+        let handle = std::thread::spawn(move || {
+            let r = lsp::drive_references(
+                &mut stdout,
+                &mut stdin,
+                &root_uri,
+                &file_uri,
+                &lang,
+                &text,
+                line,
+                character,
+            );
+            let _ = tx.send(r);
+        });
+        let result = rx.recv_timeout(self.timeout).ok().flatten();
+        let _ = child.kill();
+        let _ = handle.join();
+        let prefix = format!("file://{root_disp}/");
+        result.map(|refs| {
+            refs.into_iter()
+                .filter_map(|(uri, l)| uri.strip_prefix(&prefix).map(|rel| (rel.to_string(), l)))
+                .collect()
+        })
+    }
+}
+
 /// LSP wire protocol (Phase 2a): the pure, fully-tested transport core a real
 /// `LspProvider` (Phase 2b: spawn server + handshake) builds on. Kept here so the
 /// hard correctness parts — Content-Length framing, JSON-RPC id correlation, the
@@ -347,5 +420,32 @@ mod tests {
         assert_eq!(p.tier(), Tier::None);
         assert_eq!(Tier::Partial.label(), "lexical-approx");
         assert_eq!(Tier::Full.label(), "lsp");
+    }
+
+    #[test]
+    fn lsp_provider_degrades_when_server_is_missing() {
+        // SCRY-150: a non-existent server binary → spawn fails → None (no panic, no
+        // hang), so the engine falls back to its approximation.
+        let p = LspProvider {
+            argv: vec!["vyer_definitely_no_such_server_xyz".into()],
+            root: std::env::temp_dir(),
+            lang_id: "rust".into(),
+            timeout: std::time::Duration::from_millis(500),
+        };
+        assert!(p.references_at("a.rs", 0, 0).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lsp_provider_degrades_when_server_says_nothing() {
+        // SCRY-150: a server that exits immediately (`true`) → EOF before any LSP
+        // response → None, promptly, via the real child pipe (no hang).
+        let p = LspProvider {
+            argv: vec!["true".into()],
+            root: std::env::temp_dir(),
+            lang_id: "rust".into(),
+            timeout: std::time::Duration::from_secs(2),
+        };
+        assert!(p.references_at("a.rs", 0, 0).is_none());
     }
 }
