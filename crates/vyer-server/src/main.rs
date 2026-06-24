@@ -121,9 +121,18 @@ fn build_engine(args: &[String]) -> Result<Engine, String> {
     // (repeatable) registers an OPERATOR allowlist of named tasks the agent may run
     // BY NAME (never a command string — Rule §3). e.g. --run test="cargo test -q".
     cfg.allow_run = has(args, "--allow-run");
-    // SCRY-144: LSP sidecar opt-in (Phase 1 reports intent in status; Phase 2 wires
-    // a real language server behind this flag).
+    // SCRY-144/151: LSP sidecar opt-in + per-language server allowlist. `--allow-lsp`
+    // gates it; `--lsp lang="<cmd>"` (repeatable) registers a server the agent reaches
+    // only via detail=refs (never a request-supplied command — Rule §3).
     cfg.allow_lsp = has(args, "--allow-lsp");
+    for spec in multi_flag(args, "--lsp") {
+        if let Some((lang, cmd)) = spec.split_once('=') {
+            let argv: Vec<String> = cmd.split_whitespace().map(|w| w.to_string()).collect();
+            if !lang.trim().is_empty() && !argv.is_empty() {
+                cfg.lsp_servers.insert(lang.trim().to_string(), argv);
+            }
+        }
+    }
     // SCRY-141: when run is enabled, seed a SAFE default allowlist from the repo's
     // manifests (build/test/lint/check) so `--allow-run` alone works zero-config.
     if cfg.allow_run {

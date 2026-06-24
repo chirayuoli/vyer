@@ -389,6 +389,12 @@ pub struct EngineConfig {
     /// `docs/design-lsp-sidecar.md`), so this currently just reports intent in
     /// `vyer://status`. Phase 2 wires a real language server behind this flag.
     pub allow_lsp: bool,
+    /// SCRY-151 (LSP Phase 2d): OPERATOR-configured language servers, keyed by lang
+    /// id (`rust`→`["rust-analyzer"]`, `ts`→`["typescript-language-server","--stdio"]`).
+    /// Consulted only when `allow_lsp`; the request never supplies a command (Rule §3).
+    /// When a server answers, `detail=refs` upgrades to type-resolved (`tier=lsp`);
+    /// otherwise it degrades to the lexical approximation (default = no change).
+    pub lsp_servers: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 impl EngineConfig {
@@ -402,6 +408,7 @@ impl EngineConfig {
             run_tasks: std::collections::BTreeMap::new(),
             allow_run: false,
             allow_lsp: false,
+            lsp_servers: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -2139,6 +2146,23 @@ impl Engine {
     /// cheap resident-text substring check. graph=partial(approx): a same-named
     /// symbol elsewhere counts conservatively (better to refuse a delete than
     /// silently break callers); `force:true` overrides.
+    /// SCRY-151: build an [`LspProvider`] for `lang` if the operator enabled
+    /// `--allow-lsp` AND configured a server for that language (`--lsp lang=cmd`).
+    /// `None` otherwise → the caller uses its lexical approximation (no change).
+    fn lsp_provider_for(&self, lang: vyer_incr::Lang) -> Option<crate::semantic::LspProvider> {
+        if !self.config.allow_lsp {
+            return None;
+        }
+        let key = lsp_lang_key(lang)?;
+        let argv = self.config.lsp_servers.get(key)?.clone();
+        Some(crate::semantic::LspProvider {
+            argv,
+            root: self.config.root.clone(),
+            lang_id: key.to_string(),
+            timeout: std::time::Duration::from_secs(15),
+        })
+    }
+
     fn external_refs(&self, db: &Db, name: &str, def_file: &str) -> Vec<(String, u32)> {
         let _ = def_file; // kept for API symmetry / future type-scoping (Phase 2)
         let pattern = format!(r"\b{}\b", regex_escape_ident(name));
@@ -2283,13 +2307,58 @@ impl Engine {
             }
         }
 
+        // SCRY-151 (LSP Phase 2d): UPGRADE to type-resolved references when a server
+        // is configured for the def's language. The lexical `refs` above are the
+        // fallback; if the server answers, replace them and report tier=lsp. Default
+        // (no --lsp / no server / server silent) leaves the lexical result untouched,
+        // so existing behavior + tests are unchanged.
+        let mut tier = "lexical-approx";
+        if let Some((def_file, def_sym)) = defs.first() {
+            if let Some(provider) = self.lsp_provider_for(vyer_incr::detect_lang(def_file)) {
+                if let Some(text) = db.text(def_file) {
+                    // 0-based (line, char) of the name on its definition line.
+                    let line_txt = text
+                        .lines()
+                        .nth((def_sym.start as usize).saturating_sub(1))
+                        .unwrap_or("");
+                    let char0 = line_txt
+                        .find(name)
+                        .map(|b| line_txt[..b].chars().count())
+                        .unwrap_or(0) as u32;
+                    let line0 = def_sym.start.saturating_sub(1);
+                    if let Some(lsp_refs) = provider.references_at(def_file, line0, char0) {
+                        refs = lsp_refs
+                            .into_iter()
+                            .map(|(f, l)| {
+                                let t = db
+                                    .text(&f)
+                                    .and_then(|tx| {
+                                        tx.lines()
+                                            .nth((l as usize).saturating_sub(1))
+                                            .map(|s| s.trim().to_string())
+                                    })
+                                    .unwrap_or_default();
+                                (f, l, t)
+                            })
+                            .collect();
+                        tier = "lsp";
+                    }
+                }
+            }
+        }
+        let graph = if tier == "lsp" {
+            "full"
+        } else {
+            "partial(approx)"
+        };
+
         let mut spans = Vec::new();
         for (f, s) in &defs {
             let text = db.text(f).unwrap_or_else(|| std::sync::Arc::from(""));
             let id = make_id(f, Some(name), s.start, s.end, &text);
             spans.push(budget::Span {
                 id,
-                text: format!("def [{}] {}  graph=partial(approx)", s.kind, s.signature),
+                text: format!("def [{}] {}  graph={graph}", s.kind, s.signature),
                 score: 1.0,
             });
         }
@@ -2297,7 +2366,7 @@ impl Engine {
         let cap = q.k.max(1) * 6;
         let shown = refs.len().min(cap);
         let mut body = format!(
-            "references to `{name}`: defs={} refs={} (showing {}) graph=partial(approx) tier=lexical-approx{scope_note}\n",
+            "references to `{name}`: defs={} refs={} (showing {}) graph={graph} tier={tier}{scope_note}\n",
             defs.len(),
             refs.len(),
             shown
@@ -6538,6 +6607,30 @@ fn symbol_slice(text: &str, start: u32, end: u32) -> String {
 /// derived artifacts (codegen / protobuf / minified) an agent rarely needs to
 /// *understand*, so the repo-map demotes them below hand-written code. Only
 /// strong, near-universal suffix conventions — never a guess on plain sources.
+/// SCRY-151: map a detected language to the `--lsp` config key an operator uses.
+/// `None` for languages we don't expose an LSP key for yet.
+fn lsp_lang_key(lang: vyer_incr::Lang) -> Option<&'static str> {
+    use vyer_incr::Lang;
+    Some(match lang {
+        Lang::Rust => "rust",
+        Lang::Python => "python",
+        Lang::TypeScript => "ts",
+        Lang::Tsx => "tsx",
+        Lang::JavaScript => "js",
+        Lang::Go => "go",
+        Lang::Dart => "dart",
+        Lang::Java => "java",
+        Lang::Ruby => "ruby",
+        Lang::Swift => "swift",
+        Lang::Kotlin => "kotlin",
+        Lang::C => "c",
+        Lang::Cpp => "cpp",
+        Lang::CSharp => "cs",
+        Lang::Php => "php",
+        Lang::Generic => return None,
+    })
+}
+
 fn is_generated(path: &str) -> bool {
     const SUFFIXES: &[&str] = &[
         ".g.dart",
@@ -8788,6 +8881,40 @@ mod tests {
         assert!(
             !refused,
             "force:true overrides the generated-file guard: {forced:?}"
+        );
+    }
+
+    #[test]
+    fn refs_lsp_wiring_degrades_to_lexical_when_server_silent() {
+        // SCRY-151: with --allow-lsp + a configured server that answers nothing
+        // (`true` exits immediately), detail=refs must degrade to the lexical result
+        // and report tier=lexical-approx — the wiring never regresses the default.
+        let mut engine = engine_with(&[
+            ("src/a.rs", "fn helper() {}\n"),
+            ("src/b.rs", "fn use_it() {\n    helper()\n}\n"),
+        ]);
+        engine.config.allow_lsp = true;
+        engine
+            .config
+            .lsp_servers
+            .insert("rust".into(), vec!["true".into()]);
+        let out = engine.code(&CodeRequest {
+            queries: vec![Query {
+                q: "helper".into(),
+                detail: "refs".into(),
+                ..base_query()
+            }],
+            budget_tokens: 8000,
+            exclude_seen: false,
+        });
+        assert!(out.contains("references to `helper`"), "{out}");
+        assert!(
+            out.contains("tier=lexical-approx"),
+            "a silent server must degrade to lexical: {out}"
+        );
+        assert!(
+            out.contains("src/b.rs"),
+            "the lexical reference is preserved: {out}"
         );
     }
 
