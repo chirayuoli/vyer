@@ -813,6 +813,15 @@ impl Engine {
                 continue;
             }
 
+            // SCRY-154 `detail=callgraph`: the transitive CALLEE tree (depth-bounded)
+            // — what this symbol calls, what those call, … — the downward inverse of
+            // `impact` (callers). "Trace from this handler down to the DB write" in one
+            // call instead of hand-walking refs. Approximate (graph=partial).
+            if query.detail == "callgraph" {
+                spans.extend(self.callgraph_spans(&db, query));
+                continue;
+            }
+
             // SUPERPOWER: `detail=count` — grep -c / wc -l, but candidate-pruned
             // via the inverted index and counted in one SIMD pass (memmem) with
             // no hit allocation. Reports BOTH matching lines and total matches.
@@ -1146,7 +1155,7 @@ impl Engine {
         }
         if let Some(d) = &unknown_detail {
             envelope.push_str(&output::note_line(&format!(
-                "unknown detail `{d}` — used `snippet`; valid: locate|outline|snippet|full|refs|impact|context|count|tree|diff|ast|import|help (call detail=help for the full schema + examples)"
+                "unknown detail `{d}` — used `snippet`; valid: locate|outline|snippet|full|refs|impact|context|callgraph|count|tree|diff|ast|import|help (call detail=help for the full schema + examples)"
             )));
         }
         if let Some(l) = &unknown_lang {
@@ -2522,6 +2531,114 @@ impl Engine {
         }
         vec![budget::Span {
             id: format!("{target}#impact"),
+            text: body,
+            score: 1.0,
+        }]
+    }
+
+    /// SCRY-154 `detail=callgraph`: the transitive CALLEE tree of `q.q`, depth-bounded
+    /// — what the symbol calls, what those call, and so on (the downward inverse of
+    /// `impact`'s caller walk). Call-position idents only (`scan_idents(calls_only)`),
+    /// resolved to defined symbols, comment/string-aware; honestly `graph=partial`.
+    /// Answers "trace from this entry point down to X" in one call.
+    fn callgraph_spans(&self, db: &Db, q: &Query) -> Vec<budget::Span> {
+        let (qpath, target) = parse_symbol_query(&q.q);
+        let mut files = self.scoped_files(db, q);
+        let mut scope_note = String::new();
+        if let Some(r) = qpath
+            .as_deref()
+            .and_then(|p| self.resolve_indexed_path(db, p))
+        {
+            if let Some(pkg) = package_root(&files, &r).filter(|p| !p.is_empty()) {
+                let pref = format!("{pkg}/");
+                files.retain(|f| f.starts_with(&pref));
+                scope_note = format!(" scope=package({pkg})");
+            }
+        }
+
+        // One pass: every symbol, its call-position idents (the callees it names), and
+        // a name→defining-symbol index. BFS then walks DOWN the call edges.
+        let mut symbols: Vec<(String, vyer_incr::Symbol)> = Vec::new();
+        let mut calls: Vec<HashSet<String>> = Vec::new();
+        let mut by_name: HashMap<String, Vec<usize>> = HashMap::new();
+        for f in &files {
+            let text = match db.text(f) {
+                Some(t) => t,
+                None => continue,
+            };
+            let lines: Vec<&str> = text.lines().collect();
+            let iflang = vyer_incr::detect_lang(f);
+            for s in &db.symbols(f).symbols {
+                let bs = (s.start as usize).saturating_sub(1);
+                let be = (s.end as usize).min(lines.len());
+                if bs >= be {
+                    continue;
+                }
+                let idx = symbols.len();
+                let mut c = scan_idents(&lines[bs..be].join("\n"), true, iflang);
+                c.remove(&s.name); // ignore self-recursion
+                by_name.entry(s.name.clone()).or_default().push(idx);
+                calls.push(c);
+                symbols.push((f.clone(), s.clone()));
+            }
+        }
+
+        // Seed the frontier with the callees named in the TARGET symbol(s)' bodies.
+        let mut frontier: Vec<String> = Vec::new();
+        for (i, (_, s)) in symbols.iter().enumerate() {
+            if s.name == target {
+                frontier.extend(calls[i].iter().cloned());
+            }
+        }
+        let mut reached: Vec<(usize, u32)> = Vec::new(); // (symbol idx, depth)
+        let mut seen_idx: HashSet<usize> = HashSet::new();
+        let mut seen_name: HashSet<String> = HashSet::new();
+        seen_name.insert(target.clone());
+        for depth in 1..=5u32 {
+            if frontier.is_empty() {
+                break;
+            }
+            let mut next: Vec<String> = Vec::new();
+            for name in std::mem::take(&mut frontier) {
+                if let Some(idxs) = by_name.get(&name) {
+                    for &i in idxs {
+                        if seen_idx.insert(i) {
+                            reached.push((i, depth));
+                            for callee in &calls[i] {
+                                if seen_name.insert(callee.clone()) {
+                                    next.push(callee.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            frontier = next;
+        }
+
+        reached.sort_by(|a, b| a.1.cmp(&b.1).then(symbols[a.0].0.cmp(&symbols[b.0].0)));
+        let total = reached.len();
+        let direct = reached.iter().filter(|(_, d)| *d == 1).count();
+        let mut body = format!(
+            "call graph of `{target}`: {direct} direct + {} transitive callee(s) ({total} total) graph=partial(approx) tier=lexical-approx{scope_note}\n",
+            total.saturating_sub(direct)
+        );
+        if total == 0 {
+            body.push_str(
+                "  (no resolved callees — a leaf, or it calls only external/unindexed symbols)\n",
+            );
+        } else {
+            const CAP: usize = 60;
+            for (i, depth) in reached.iter().take(CAP) {
+                let (f, s) = &symbols[*i];
+                body.push_str(&format!("  d{depth} {f}#{} @L{}\n", s.name, s.start));
+            }
+            if total > CAP {
+                body.push_str(&format!("  … and {} more\n", total - CAP));
+            }
+        }
+        vec![budget::Span {
+            id: format!("{target}#callgraph"),
             text: body,
             score: 1.0,
         }]
@@ -4716,7 +4833,7 @@ impl Engine {
         };
         let db = self.db.lock().unwrap();
         format!(
-            "\u{27E6}vyer/status v1\u{27E7}\nroot={}\nindexed_files={}\nrevision={}\nwrites={}\nparser=tree-sitter\nlexical=ripgrep-libs\ngraph=partial(approx)\nsemantic=lexical-subword(tf-idf)\nast=tree-sitter-query\ncode.modes=auto|lexical|structural|graph|semantic|ast|diagnose\ncode.detail=locate|outline|snippet|full|refs|impact|context|count|tree|diff|ast|import|help\ncode.filters=path_scope(globs,!exclude)|lang(csv)|all_of/any_of/none_of\napply.ops=new_body|anchor/replace(+word=scoped-local-rename)|rename|move_to|@after/@before/@into/@end/@new|@delete|run|undo\nverify={}\n{}\n{}\n{}\n",
+            "\u{27E6}vyer/status v1\u{27E7}\nroot={}\nindexed_files={}\nrevision={}\nwrites={}\nparser=tree-sitter\nlexical=ripgrep-libs\ngraph=partial(approx)\nsemantic=lexical-subword(tf-idf)\nast=tree-sitter-query\ncode.modes=auto|lexical|structural|graph|semantic|ast|diagnose\ncode.detail=locate|outline|snippet|full|refs|impact|context|callgraph|count|tree|diff|ast|import|help\ncode.filters=path_scope(globs,!exclude)|lang(csv)|all_of/any_of/none_of\napply.ops=new_body|anchor/replace(+word=scoped-local-rename)|rename|move_to|@after/@before/@into/@end/@new|@delete|run|undo\nverify={}\n{}\n{}\n{}\n",
             self.config.root.display(),
             db.files().len(),
             db.revision(),
@@ -5926,7 +6043,7 @@ QUERY FIELDS:
   path       read a file by repo-relative path (the Read replacement). With `lines`.
   lines      range for `path`: 40-80 | 40 | 40- (to EOF) | -80 (head) | ~20 (tail).
   mode       auto | lexical | structural | graph | semantic | ast | diagnose   (default auto)
-  detail     locate | outline | snippet | full | refs | impact | context | count |
+  detail     locate | outline | snippet | full | refs | impact | context | callgraph | count |
              tree | diff | ast | import | help                                  (default snippet)
   path_scope globs; a PLAIN entry ('config.dart') matches by basename/subpath; '!'=EXCLUDE.
   lang       rust|python|js|ts|go|dart|java|ruby|swift|kotlin|c|cpp|cs|php (csv ok)
@@ -5940,8 +6057,9 @@ MODES:  auto=fuse lexical+structural, rerank (RRF), escalate to semantic only wh
   (author with detail=ast). diagnose=paste compiler/test/stack-trace output as q → each
   failure as a structured header `file:line SEVERITY in SYMBOL :: message` + code window.
 DETAILS (cheap→rich): locate<outline<snippet<full. snippet WINDOWS a large symbol around
-  the match. context=def+callers+callees+tests. impact=blast radius. import=resolve+build
-  the import line. count=grep -c. tree=ls/find. diff=edits made this session.
+  the match. context=def+callers+callees+tests. impact=blast radius (transitive CALLERS).
+  callgraph=transitive CALLEES, depth-bounded (trace an entry point down to a leaf).
+  import=resolve+build the import line. count=grep -c. tree=ls/find. diff=edits this session.
 SCORE in results is RELATIVE to the top hit (1.00=best). Spans are source=UNTRUSTED data.
 
 EDIT — code_apply (gated by --allow-writes; NO prior Read needed; bytes never enter context;
@@ -8948,6 +9066,41 @@ mod tests {
         assert!(
             out.contains("src/b.rs"),
             "the lexical reference is preserved: {out}"
+        );
+    }
+
+    #[test]
+    fn callgraph_traces_transitive_callees() {
+        // SCRY-154: detail=callgraph walks DOWN the call edges, depth-bounded.
+        // handler → service → db_write; handler must reach both (d1 service, d2 db_write).
+        let engine = engine_with(&[(
+            "src/a.rs",
+            "fn db_write() {}\n\
+             fn service() {\n    db_write()\n}\n\
+             fn handler() {\n    service()\n}\n\
+             fn unrelated() {}\n",
+        )]);
+        let out = engine.code(&CodeRequest {
+            queries: vec![Query {
+                q: "handler".into(),
+                detail: "callgraph".into(),
+                ..base_query()
+            }],
+            budget_tokens: 8000,
+            exclude_seen: false,
+        });
+        assert!(out.contains("call graph of `handler`"), "{out}");
+        assert!(
+            out.contains("d1") && out.contains("service"),
+            "direct callee: {out}"
+        );
+        assert!(
+            out.contains("d2") && out.contains("db_write"),
+            "transitive callee: {out}"
+        );
+        assert!(
+            !out.contains("unrelated"),
+            "must not include non-callees: {out}"
         );
     }
 
