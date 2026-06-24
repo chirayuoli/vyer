@@ -296,9 +296,149 @@ pub mod lsp {
         parse_references(&body, 2)
     }
 
+    /// A WARM, long-lived LSP connection (Phase 2e core): a server is spawned and
+    /// `initialize`d ONCE, then reused across many requests — avoiding the multi-second
+    /// cold init a real server pays per spawn (the "wayyy faster / keep resources down"
+    /// win). A dedicated reader thread pumps framed messages off the server's stdout
+    /// into a channel; `request` correlates responses by id (skipping the server's
+    /// interleaved notifications) and is bounded by a timeout, so a hung server never
+    /// blocks a query. On EOF/crash the channel closes and the conn marks itself dead
+    /// (the pool then drops + respawns it). Constructed over generic streams so the
+    /// concurrency core is unit-tested with in-memory mocks — no process, no hang.
+    pub struct WarmConn {
+        stdin: Box<dyn std::io::Write + Send>,
+        frames: std::sync::mpsc::Receiver<String>,
+        next_id: i64,
+        alive: bool,
+    }
+
+    impl WarmConn {
+        /// Spawn the reader pump over `reader`; send via `writer`. (The caller wires
+        /// these to a child's stdout/stdin; tests pass in-memory streams.)
+        pub fn new<R, W>(reader: R, writer: W) -> Self
+        where
+            R: Read + Send + 'static,
+            W: std::io::Write + Send + 'static,
+        {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut reader = reader;
+                let mut buf: Vec<u8> = Vec::new();
+                loop {
+                    while let Some((body, used)) = parse_frame(&buf) {
+                        buf.drain(..used);
+                        if tx.send(body).is_err() {
+                            return; // consumer dropped → stop pumping
+                        }
+                    }
+                    if buf.len() > (8 << 20) {
+                        return; // runaway frame → bail (channel closes → conn dead)
+                    }
+                    let mut chunk = [0u8; 4096];
+                    match reader.read(&mut chunk) {
+                        Ok(0) | Err(_) => return, // EOF / error → server gone
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+            });
+            WarmConn {
+                stdin: Box::new(writer),
+                frames: rx,
+                next_id: 0,
+                alive: true,
+            }
+        }
+
+        pub fn alive(&self) -> bool {
+            self.alive
+        }
+
+        /// Fire a notification (no response expected), e.g. `initialized`/`didOpen`.
+        pub fn notify(&mut self, method: &str, params: Value) -> bool {
+            let n = json!({"jsonrpc":"2.0","method":method,"params":params}).to_string();
+            let ok = self.stdin.write_all(&frame(&n)).is_ok() && self.stdin.flush().is_ok();
+            if !ok {
+                self.alive = false;
+            }
+            ok
+        }
+
+        /// Send a request and return the matching response value (skipping any
+        /// interleaved notifications / other ids), bounded by `timeout`. `None` on
+        /// timeout, write failure, or a dead connection.
+        pub fn request(
+            &mut self,
+            method: &str,
+            params: Value,
+            timeout: std::time::Duration,
+        ) -> Option<Value> {
+            if !self.alive {
+                return None;
+            }
+            self.next_id += 1;
+            let id = self.next_id;
+            let req = json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}).to_string();
+            if self.stdin.write_all(&frame(&req)).is_err() || self.stdin.flush().is_err() {
+                self.alive = false;
+                return None;
+            }
+            let deadline = std::time::Instant::now() + timeout;
+            loop {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                match self.frames.recv_timeout(remaining) {
+                    Ok(body) => {
+                        let v: Value = match serde_json::from_str(&body) {
+                            Ok(v) => v,
+                            Err(_) => continue,
+                        };
+                        if v.get("id").and_then(Value::as_i64) == Some(id) {
+                            return Some(v);
+                        }
+                        // else: a notification or a stale id → keep waiting.
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return None,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        self.alive = false;
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn warmconn_correlates_ids_skips_notifications_and_detects_eof() {
+            use std::time::Duration;
+            // server pre-queues: response id=1, an interleaved notification, response
+            // id=2 — then EOF (the Cursor ends).
+            let mut out = Vec::new();
+            out.extend_from_slice(&frame(
+                &json!({"jsonrpc":"2.0","id":1,"result":"a"}).to_string(),
+            ));
+            out.extend_from_slice(&frame(
+                &json!({"jsonrpc":"2.0","method":"log","params":{}}).to_string(),
+            ));
+            out.extend_from_slice(&frame(
+                &json!({"jsonrpc":"2.0","id":2,"result":"b"}).to_string(),
+            ));
+            let reader = std::io::Cursor::new(out);
+            let writer: Vec<u8> = Vec::new(); // sink (moved into the conn)
+            let mut c = WarmConn::new(reader, writer);
+            // request #1 (id=1) → "a"; request #2 (id=2) → "b", skipping the notification.
+            let r1 = c.request("m1", json!({}), Duration::from_secs(2)).unwrap();
+            assert_eq!(r1["result"], "a");
+            let r2 = c.request("m2", json!({}), Duration::from_secs(2)).unwrap();
+            assert_eq!(r2["result"], "b");
+            // nothing left + reader EOF → the pump exits, channel disconnects → dead.
+            assert!(c
+                .request("m3", json!({}), Duration::from_millis(300))
+                .is_none());
+            assert!(!c.alive(), "EOF/crash must mark the connection dead");
+        }
 
         #[test]
         fn drive_references_handshakes_skips_notifications_and_parses() {
