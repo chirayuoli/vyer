@@ -669,6 +669,13 @@ impl Engine {
             HashSet::new()
         };
 
+        // SCRY-142: per-query FAIR-SHARE budget. In a BATCH, one query that matches a
+        // lot (and returns big spans) used to consume the whole token pool and starve
+        // its siblings — so batching, which should help, hurt. Cap each query's
+        // contribution to ~budget/N (with a floor, and always its top span). A single
+        // query (N=1) gets the full budget, so non-batch behavior is unchanged.
+        let per_query_budget = (req.budget_tokens / req.queries.len().max(1)).max(600);
+
         for query in &req.queries {
             summary_q.push(format!("{}({}/{})", query.q, query.mode, query.detail));
             marks.push(spans.len());
@@ -919,6 +926,8 @@ impl Engine {
                 }
             }
 
+            let mut q_used = 0usize;
+            let mut q_pushed = 0usize;
             for (id, score) in fused
                 .into_iter()
                 .filter(|(id, _)| !req.exclude_seen || !seen_snapshot.contains(id))
@@ -926,6 +935,14 @@ impl Engine {
             {
                 if let Some(c) = cands.get(&id) {
                     if let Some(span) = self.expand(&db, query, &id, c, score) {
+                        // SCRY-142: stop once this query has used its fair share — but
+                        // always keep its top span so every query in a batch is heard.
+                        let cost = budget::est_tokens(&span.text) + 8;
+                        if q_pushed >= 1 && q_used + cost > per_query_budget {
+                            break;
+                        }
+                        q_used += cost;
+                        q_pushed += 1;
                         spans.push(span);
                     }
                 }
@@ -8680,6 +8697,46 @@ mod tests {
         assert!(
             out.contains("new_body") && out.contains("locator") && out.contains("dry_run"),
             "help missing apply essentials: {out}"
+        );
+    }
+
+    #[test]
+    fn batch_query_fair_share_budget() {
+        // SCRY-142: in a batch, a greedy query (many big matches) must not starve a
+        // sibling — the sibling's top hit must still appear.
+        let mut big = String::from("// greedy file\n");
+        for i in 0..60 {
+            big.push_str(&format!(
+                "fn needle_{i}() {{\n    let x = needle_marker;\n}}\n"
+            ));
+        }
+        let engine = engine_with(&[
+            ("src/greedy.rs", &big),
+            ("src/lonely.rs", "fn unique_sibling_symbol() {}\n"),
+        ]);
+        let req = CodeRequest {
+            queries: vec![
+                Query {
+                    q: "needle_marker".into(),
+                    mode: "lexical".into(),
+                    detail: "snippet".into(),
+                    k: 60,
+                    ..base_query()
+                },
+                Query {
+                    q: "unique_sibling_symbol".into(),
+                    mode: "lexical".into(),
+                    detail: "locate".into(),
+                    ..base_query()
+                },
+            ],
+            budget_tokens: 1200, // tight, so a greedy q1 could starve q2 without fairness
+            exclude_seen: false,
+        };
+        let out = engine.code(&req);
+        assert!(
+            out.contains("unique_sibling_symbol"),
+            "the sibling query's hit must survive a greedy batch-mate: {out}"
         );
     }
 
