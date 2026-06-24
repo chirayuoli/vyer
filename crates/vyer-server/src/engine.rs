@@ -3265,6 +3265,61 @@ impl Engine {
             }
         }
 
+        // SCRY-139 (guiding master): refuse a rename onto a name that ALREADY exists
+        // as a symbol — a symbol-aware rename would then merge/shadow two distinct
+        // symbols (a subtle correctness mistake). Name the existing site(s); force:true
+        // overrides. Pre-flight (no mutation yet).
+        for e in &req.edits {
+            if e.force {
+                continue;
+            }
+            let Some(new_name) = e.rename.as_deref().map(str::trim).filter(|s| !s.is_empty())
+            else {
+                continue;
+            };
+            let raw = e.locator.split(" :: ").next().unwrap_or(&e.locator).trim();
+            let old = raw
+                .split_once('#')
+                .map(|(_, t)| t.split('@').next().unwrap_or(t))
+                .map(|t| t.rsplit(['.', ':']).next().unwrap_or(t))
+                .unwrap_or("");
+            if new_name == old {
+                continue;
+            }
+            let scope: Vec<String> = if e.path_scope.is_empty() {
+                db.files()
+            } else {
+                db.files()
+                    .into_iter()
+                    .filter(|f| path_in_scope(f, &e.path_scope))
+                    .collect()
+            };
+            let mut collisions: Vec<String> = Vec::new();
+            for f in &scope {
+                for s in &db.symbols(f).symbols {
+                    if s.name == new_name {
+                        collisions.push(format!("{f}:{}", s.start));
+                    }
+                }
+            }
+            if !collisions.is_empty() {
+                let shown: Vec<String> = collisions.iter().take(5).cloned().collect();
+                let more = collisions.len().saturating_sub(shown.len());
+                let tail = if more > 0 {
+                    format!(", +{more} more")
+                } else {
+                    String::new()
+                };
+                return Err(format!(
+                    "refusing to rename `{old}`→`{new_name}`: a symbol named `{new_name}` already exists \
+                     ({} site(s): {}{tail}) — the rename would collide/merge them. Pick a free name, scope \
+                     with path_scope, or pass force:true.",
+                    collisions.len(),
+                    shown.join(", ")
+                ));
+            }
+        }
+
         let result: Result<String, String> = (|| {
             let mut report = String::new();
             for e in &req.edits {
@@ -5515,8 +5570,11 @@ EDIT — code_apply (gated by --allow-writes; NO prior Read needed; bytes never 
   create a file:      {\"locator\":\"src/new.rs#@new\",\"new_body\":\"…\"}
   rename repo-wide:   {\"locator\":\"src/a.rs#Old\",\"rename\":\"New\"}
   also: word:true (scoped local rename), move_to, @after:/@end/@into:Container, undo:N.
-  safe-delete:        {\"locator\":\"src/a.rs#@delete:foo\"}  ← REFUSED if `foo` still has
-                      references (names the sites); pass \"force\":true to delete anyway.
+  GUARDRAILS (guiding master; all overridable with \"force\":true):
+   • @delete:SYM is REFUSED if SYM still has references (names the sites).
+   • rename onto an EXISTING symbol name is REFUSED (would merge two symbols).
+   • a new_body symbol edit reports its blast-radius (caller count + sites) so you
+     verify callers — shown on dry_run too, i.e. BEFORE you commit.
   A locator from a result (PATH#SYM@Lrange :: blake3=…) pastes back verbatim; the blake3 is
   an OPTIMISTIC-CONCURRENCY precondition (rejected if the symbol changed since you read it).
 ";
@@ -8099,6 +8157,49 @@ mod tests {
         let err = engine.code_apply(&req).unwrap_err();
         assert!(err.contains("locator"), "{err}");
         assert!(err.contains("PATH#SYMBOL"), "explains the format: {err}");
+    }
+
+    #[test]
+    fn rename_onto_existing_name_is_refused() {
+        // SCRY-139 (guiding master): renaming onto a name that already exists would
+        // merge two distinct symbols — refuse and name the clash.
+        let mut engine = engine_with(&[("src/a.rs", "fn alpha() {}\nfn beta() {}\n")]);
+        engine.config.allow_writes = true;
+        let mk = |force: bool| ApplyRequest {
+            edits: vec![Edit {
+                locator: "src/a.rs#alpha".into(),
+                rename: Some("beta".into()),
+                force,
+                ..Default::default()
+            }],
+            dry_run: true,
+            undo: None,
+        };
+        let err = engine.code_apply(&mk(false)).unwrap_err();
+        assert!(
+            err.contains("already exists") && err.contains("beta"),
+            "{err}"
+        );
+        // force overrides.
+        let forced = engine.code_apply(&mk(true));
+        assert!(
+            forced.is_ok() || !forced.unwrap_err().contains("already exists"),
+            "force:true must override the collision guard"
+        );
+        // renaming to a FREE name is fine.
+        let free = engine.code_apply(&ApplyRequest {
+            edits: vec![Edit {
+                locator: "src/a.rs#alpha".into(),
+                rename: Some("gamma".into()),
+                ..Default::default()
+            }],
+            dry_run: true,
+            undo: None,
+        });
+        assert!(
+            free.is_ok() || !free.unwrap_err().contains("already exists"),
+            "rename to a free name must not be refused"
+        );
     }
 
     #[test]
