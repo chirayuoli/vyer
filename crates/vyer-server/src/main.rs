@@ -61,6 +61,10 @@ vyer — local-first code-context engine (MCP)
 
 USAGE:
   vyer serve [--root P] [--allow-writes] [--audit FILE] [--verify \"<cmd>\"]
+             [--allow-run --run test=\"cargo test -q\" --run lint=\"cargo clippy\"]
+                                       # --allow-run + --run NAME=\"<cmd>\" expose
+                                       # operator-allowlisted tasks the agent runs by
+                                       # NAME via code_apply {\"run\":\"test\"} (Rule §3)
   vyer serve --http 127.0.0.1:7777 --token <TOKEN> [--allow-writes]
                                        # --verify \"cargo check\" runs after each write
                                        # batch and reports compile/test pass/fail inline
@@ -113,6 +117,18 @@ fn build_engine(args: &[String]) -> Result<Engine, String> {
             .map(|w| w.to_string())
             .collect::<Vec<_>>()
     });
+    // SCRY-140 code_run: `--allow-run` gates execution; `--run name="<cmd args>"`
+    // (repeatable) registers an OPERATOR allowlist of named tasks the agent may run
+    // BY NAME (never a command string — Rule §3). e.g. --run test="cargo test -q".
+    cfg.allow_run = has(args, "--allow-run");
+    for spec in multi_flag(args, "--run") {
+        if let Some((name, cmd)) = spec.split_once('=') {
+            let argv: Vec<String> = cmd.split_whitespace().map(|w| w.to_string()).collect();
+            if !name.trim().is_empty() && !argv.is_empty() {
+                cfg.run_tasks.insert(name.trim().to_string(), argv);
+            }
+        }
+    }
     Engine::new(cfg).map_err(|e| format!("failed to index repo: {e}"))
 }
 
@@ -473,6 +489,7 @@ fn cmd_apply(args: &[String]) -> Result<(), String> {
         }],
         dry_run: !write,
         undo: None,
+        run: None,
     })?;
     print!("{report}");
     if !write {

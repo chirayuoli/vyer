@@ -286,6 +286,12 @@ pub struct ApplyRequest {
     /// files exactly as they were). When set, `edits` is ignored.
     #[serde(default)]
     pub undo: Option<usize>,
+    /// SCRY-140 code_run: execute an OPERATOR-allowlisted task by NAME (e.g.
+    /// `{"run":"test"}`) and return structured diagnostics. Gated by `--allow-run`.
+    /// The request supplies only the task name — never a command/args (Rule §3).
+    /// When set, `edits` is ignored.
+    #[serde(default)]
+    pub run: Option<String>,
 }
 
 // SCRY-128: like `code`, accept the single-edit shape an agent guesses first —
@@ -311,6 +317,7 @@ impl<'de> Deserialize<'de> for ApplyRequest {
             .and_then(|x| x.as_bool())
             .unwrap_or(false);
         let undo = map.get("undo").and_then(|x| x.as_u64()).map(|n| n as usize);
+        let run = map.get("run").and_then(|x| x.as_str()).map(str::to_string);
         if let Some(es) = map.get("edits") {
             let arr = es.as_array().ok_or_else(|| {
                 Error::custom(
@@ -327,24 +334,27 @@ impl<'de> Deserialize<'de> for ApplyRequest {
                 edits,
                 dry_run,
                 undo,
+                run,
             })
-        } else if undo.is_some() {
+        } else if undo.is_some() || run.is_some() {
             Ok(ApplyRequest {
                 edits: Vec::new(),
                 dry_run,
                 undo,
+                run,
             })
         } else {
             // single-edit sugar: the whole object IS one edit.
             let e: Edit = serde_json::from_value(serde_json::Value::Object(map)).map_err(|err| {
                 Error::custom(format!(
-                    "invalid `code_apply` arguments: {err}. Send one edit like {{\"locator\":\"src/x.rs#foo\",\"new_body\":\"…\"}}, a batch {{\"edits\":[…]}}, or {{\"undo\":N}} — call the `code` tool with {{\"detail\":\"help\"}} for every op + a worked example"
+                    "invalid `code_apply` arguments: {err}. Send one edit like {{\"locator\":\"src/x.rs#foo\",\"new_body\":\"…\"}}, a batch {{\"edits\":[…]}}, {{\"run\":\"test\"}}, or {{\"undo\":N}} — call the `code` tool with {{\"detail\":\"help\"}} for every op + a worked example"
                 ))
             })?;
             Ok(ApplyRequest {
                 edits: vec![e],
                 dry_run,
                 undo: None,
+                run: None,
             })
         }
     }
@@ -365,6 +375,15 @@ pub struct EngineConfig {
     /// at launch (like `--allow-writes`), NEVER from a request — so this is not a
     /// generic command-execution surface (Rule §3 holds).
     pub verify_cmd: Option<Vec<String>>,
+    /// SCRY-140 `code_run`: OPERATOR-allowlisted task name → argv. The agent's
+    /// request selects a task by NAME (e.g. `{"run":"test"}`); it can never supply
+    /// a command string or args. This keeps Rule §3 (typed ops only, no shell
+    /// passthrough) — same trust model as `verify_cmd`, just request-triggered —
+    /// and folds into `code_apply` so the tool count stays at two (Rule §1).
+    pub run_tasks: std::collections::BTreeMap<String, Vec<String>>,
+    /// Gate for `code_run` (distinct effect class from writes). Off by default:
+    /// the agent cannot execute anything unless the operator passed `--allow-run`.
+    pub allow_run: bool,
 }
 
 impl EngineConfig {
@@ -375,6 +394,8 @@ impl EngineConfig {
             max_file_bytes: 1 << 20,
             audit_path: None,
             verify_cmd: None,
+            run_tasks: std::collections::BTreeMap::new(),
+            allow_run: false,
         }
     }
 }
@@ -3052,29 +3073,34 @@ impl Engine {
     /// agent learns whether the edit *compiles*, not just *parses*. The command
     /// is fixed at launch (never request-driven), so this is not a generic shell
     /// surface. Best-effort: a missing/failed-to-spawn command degrades to a note.
-    fn run_verify(&self) -> Option<String> {
-        let argv = self.config.verify_cmd.as_ref()?;
-        let (prog, args) = argv.split_first()?;
+    /// Run an OPERATOR-configured argv in the repo root and return a STRUCTURED
+    /// report (ok, or parsed diagnostics). Shared by the post-write verify
+    /// (verify_cmd) and the request-triggered `code_run` task — BOTH are
+    /// operator-allowlisted argv, never a request-supplied command string, so
+    /// Rule §3 (typed ops only, no shell passthrough) holds. `kind` labels the
+    /// report ("verify" / "run"). Best-effort: a spawn failure degrades to a note.
+    fn run_argv(&self, argv: &[String], kind: &str) -> String {
         let label = argv.join(" ");
+        let Some((prog, args)) = argv.split_first() else {
+            return format!("{kind}: empty command (operator misconfiguration)\n");
+        };
         match std::process::Command::new(prog)
             .args(args)
             .current_dir(&self.config.root)
             .output()
         {
             Ok(o) if o.status.success() => {
-                self.record("verify", format!("{label} ok"));
-                Some(format!("verify({label})=ok\n"))
+                self.record(kind, format!("{label} ok"));
+                format!("{kind}({label})=ok\n")
             }
             Ok(o) => {
                 let err = String::from_utf8_lossy(&o.stderr);
                 let out = String::from_utf8_lossy(&o.stdout);
-                self.record("verify", format!("{label} FAILED"));
+                self.record(kind, format!("{label} FAILED"));
                 // SCRY-135: pipe the build/test output through the STRUCTURED
                 // diagnostics parser (the back-half of mode=diagnose) so the agent
                 // reads "what I broke" as data — file:line [severity] :: message —
-                // not a single hand-picked error line. This is the post-edit
-                // diagnostics report, using the operator-gated verify_cmd that
-                // already runs (no new execution surface; Rules §1/§3 intact).
+                // not a single hand-picked error line.
                 let combined = format!("{err}\n{out}");
                 let diags = parse_diagnostics(&combined);
                 let mut report = String::new();
@@ -3094,11 +3120,11 @@ impl Engine {
                         })
                         .unwrap_or("(no output)")
                         .trim();
-                    report.push_str(&format!("verify({label})=FAILED: {pick}\n"));
+                    report.push_str(&format!("{kind}({label})=FAILED: {pick}\n"));
                 } else {
                     let shown = diags.len().min(10);
                     report.push_str(&format!(
-                        "verify({label})=FAILED: {} diagnostic(s) (showing {shown})\n",
+                        "{kind}({label})=FAILED: {} diagnostic(s) (showing {shown})\n",
                         diags.len()
                     ));
                     for d in diags.iter().take(10) {
@@ -3114,21 +3140,68 @@ impl Engine {
                         "  → paste the build output into `code` mode=diagnose for enclosing symbols + code windows\n",
                     );
                 }
-                // SCRY-055: the write already committed (verify runs post-apply and
-                // does not roll back, so multi-step refactors aren't blocked). Tell
-                // the agent so it can `undo:1` if this edit caused the failure.
-                report.push_str(
-                    "  note: the edit IS written; if it caused this, code_apply undo:1 to revert\n",
-                );
-                Some(report)
+                report
             }
-            Err(e) => Some(format!(
-                "verify({label})=ERROR: could not run `{label}` ({e})\n"
-            )),
+            Err(e) => format!("{kind}({label})=ERROR: could not run `{label}` ({e})\n"),
+        }
+    }
+
+    fn run_verify(&self) -> Option<String> {
+        let argv = self.config.verify_cmd.as_ref()?;
+        let mut report = self.run_argv(argv, "verify");
+        // SCRY-055: the write already committed (verify runs post-apply and does not
+        // roll back, so multi-step refactors aren't blocked). Tell the agent so it
+        // can `undo:1` if this edit caused the failure.
+        if report.contains("=FAILED") {
+            report.push_str(
+                "  note: the edit IS written; if it caused this, code_apply undo:1 to revert\n",
+            );
+        }
+        Some(report)
+    }
+
+    /// SCRY-140 `code_run`: execute an OPERATOR-allowlisted task by NAME and return
+    /// structured diagnostics — closing the agent's edit→build/test→fix loop inside
+    /// the tool. The request selects a task name only; it can NEVER supply a command
+    /// or args (Rule §3). Gated by `--allow-run` (a distinct effect class from
+    /// writes). Reached via `code_apply {"run":"test"}`, so the tool count stays at
+    /// two (Rule §1).
+    pub fn code_run(&self, task: &str) -> Result<String, String> {
+        if !self.config.allow_run {
+            self.record("code_run", "DENIED: run disabled".into());
+            return Err("command execution is disabled for this session — start the server with \
+                 `--allow-run` and register tasks via `--run name=\"<cmd>\"` (operator-allowlisted; \
+                 the request selects a task NAME, never a command)"
+                .into());
+        }
+        let task = task.trim();
+        match self.config.run_tasks.get(task) {
+            Some(argv) => {
+                self.record("code_run", format!("task={task}"));
+                Ok(self.run_argv(argv, "run"))
+            }
+            None => {
+                let avail: Vec<&str> = self.config.run_tasks.keys().map(String::as_str).collect();
+                let list = if avail.is_empty() {
+                    "(none — operator registered no --run tasks)".to_string()
+                } else {
+                    avail.join(", ")
+                };
+                Err(format!(
+                    "unknown run task `{task}`. Configured tasks: {list}. Tasks are operator-allowlisted; \
+                     select one by NAME (you cannot pass a command or args)."
+                ))
+            }
         }
     }
 
     pub fn code_apply(&self, req: &ApplyRequest) -> Result<String, String> {
+        // SCRY-140 code_run: a `run` request executes (an allowlisted task) but does
+        // NOT write — so it's gated by --allow-run, not --allow-writes, and handled
+        // before the write gate. Selecting a task by name only (Rule §3).
+        if let Some(task) = &req.run {
+            return self.code_run(task);
+        }
         if !self.config.allow_writes {
             self.record("code_apply", "DENIED: writes disabled".into());
             return Err("writes are disabled for this session (start with --allow-writes)".into());
@@ -5570,6 +5643,10 @@ EDIT — code_apply (gated by --allow-writes; NO prior Read needed; bytes never 
   create a file:      {\"locator\":\"src/new.rs#@new\",\"new_body\":\"…\"}
   rename repo-wide:   {\"locator\":\"src/a.rs#Old\",\"rename\":\"New\"}
   also: word:true (scoped local rename), move_to, @after:/@end/@into:Container, undo:N.
+  run a task:         {\"run\":\"test\"}  ← executes an OPERATOR-allowlisted task
+                      (build/test/lint) and returns STRUCTURED diagnostics
+                      (file:line severity :: message). Closes edit→test→fix. You pick
+                      a task NAME only (never a command); gated by --allow-run.
   GUARDRAILS (guiding master; all overridable with \"force\":true):
    • @delete:SYM is REFUSED if SYM still has references (names the sites).
    • rename onto an EXISTING symbol name is REFUSED (would merge two symbols).
@@ -8153,10 +8230,56 @@ mod tests {
             }],
             dry_run: true,
             undo: None,
+            run: None,
         };
         let err = engine.code_apply(&req).unwrap_err();
         assert!(err.contains("locator"), "{err}");
         assert!(err.contains("PATH#SYMBOL"), "explains the format: {err}");
+    }
+
+    #[test]
+    fn code_run_executes_allowlisted_task_only() {
+        // SCRY-140: code_run runs an OPERATOR-allowlisted task by NAME, gated by
+        // --allow-run; it never accepts a command string (Rule §3).
+        let mut engine = engine_with(&[("a.rs", "fn a() {}\n")]);
+        // disabled by default → refused.
+        let off = engine.code_apply(&ApplyRequest {
+            edits: vec![],
+            dry_run: false,
+            undo: None,
+            run: Some("test".into()),
+        });
+        assert!(
+            off.unwrap_err().contains("--allow-run"),
+            "run must be gated by --allow-run"
+        );
+        // enable + register an allowlisted task (a portable no-op: `true`).
+        engine.config.allow_run = true;
+        engine
+            .config
+            .run_tasks
+            .insert("ok".into(), vec!["true".into()]);
+        let out = engine
+            .code_apply(&ApplyRequest {
+                edits: vec![],
+                dry_run: false,
+                undo: None,
+                run: Some("ok".into()),
+            })
+            .expect("allowlisted task runs");
+        assert!(out.contains("run(true)=ok"), "structured run report: {out}");
+        // an unknown task is refused and lists the allowlist — never executes.
+        let unknown = engine.code_apply(&ApplyRequest {
+            edits: vec![],
+            dry_run: false,
+            undo: None,
+            run: Some("rm -rf /".into()),
+        });
+        let e = unknown.unwrap_err();
+        assert!(
+            e.contains("unknown run task") && e.contains("ok"),
+            "unknown task lists the allowlist, runs nothing: {e}"
+        );
     }
 
     #[test]
@@ -8174,6 +8297,7 @@ mod tests {
             }],
             dry_run: true,
             undo: None,
+            run: None,
         };
         let err = engine.code_apply(&mk(false)).unwrap_err();
         assert!(
@@ -8195,6 +8319,7 @@ mod tests {
             }],
             dry_run: true,
             undo: None,
+            run: None,
         });
         assert!(
             free.is_ok() || !free.unwrap_err().contains("already exists"),
@@ -8220,6 +8345,7 @@ mod tests {
             }],
             dry_run: true,
             undo: None,
+            run: None,
         };
         let out = engine.code_apply(&req).expect("edit ok");
         assert!(
@@ -8283,6 +8409,7 @@ mod tests {
             }],
             dry_run: true,
             undo: None,
+            run: None,
         };
         let err = engine.code_apply(&del(false)).unwrap_err();
         assert!(err.contains("refusing to delete `helper`"), "{err}");
@@ -8304,6 +8431,7 @@ mod tests {
             }],
             dry_run: true,
             undo: None,
+            run: None,
         });
         assert!(
             out.is_ok() || !out.unwrap_err().contains("refusing to delete"),

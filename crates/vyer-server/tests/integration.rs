@@ -154,6 +154,7 @@ fn one_edit(
         }],
         dry_run: false,
         undo: None,
+        run: None,
     }
 }
 
@@ -624,6 +625,7 @@ fn rename_req(locator: &str, to: &str) -> ApplyRequest {
         }],
         dry_run: false,
         undo: None,
+        run: None,
     }
 }
 
@@ -729,6 +731,7 @@ fn bulk_replace_across_glob_is_atomic_and_validated() {
         }],
         dry_run: false,
         undo: None,
+        run: None,
     };
     let out = eng.code_apply(&req).unwrap();
     assert!(out.contains("bulk replace"), "{out}");
@@ -754,6 +757,7 @@ fn move_symbol_to_another_file() {
         }],
         dry_run: false,
         undo: None,
+        run: None,
     };
     let out = eng.code_apply(&req).unwrap();
     assert!(out.contains("move `refresh`"), "{out}");
@@ -776,6 +780,7 @@ fn undo_req(n: usize) -> ApplyRequest {
         edits: vec![],
         dry_run: false,
         undo: Some(n),
+        run: None,
     }
 }
 
@@ -915,6 +920,7 @@ fn multi_edit_batch_is_atomic_on_failure() {
         ],
         dry_run: false,
         undo: None,
+        run: None,
     };
     assert!(
         eng.code_apply(&req).is_err(),
@@ -956,6 +962,7 @@ fn multi_edit_batch_commits_all_on_success() {
         ],
         dry_run: false,
         undo: None,
+        run: None,
     };
     assert!(eng.code_apply(&req).is_ok());
     assert!(eng
@@ -1000,6 +1007,7 @@ fn multi_edit_batch_rolls_back_into_op() {
         ],
         dry_run: false,
         undo: None,
+        run: None,
     };
     assert!(
         eng.code_apply(&req).is_err(),
@@ -1043,6 +1051,7 @@ fn scoped_word_rename_stays_in_one_symbol() {
             }],
             dry_run: false,
             undo: None,
+            run: None,
         })
         .expect("scoped word rename should succeed");
     assert!(
@@ -1085,6 +1094,7 @@ fn scoped_word_rename_works_in_python() {
         }],
         dry_run: false,
         undo: None,
+        run: None,
     })
     .expect("python scoped rename should succeed");
     let d = std::fs::read_to_string(root.join("m.py")).unwrap();
@@ -1243,6 +1253,7 @@ fn move_to_same_file_is_refused() {
             }],
             dry_run: false,
             undo: None,
+            run: None,
         })
         .unwrap_err();
     assert!(
@@ -1280,6 +1291,7 @@ fn batch_create_then_into_same_file() {
         ],
         dry_run: false,
         undo: None,
+        run: None,
     })
     .expect("create-then-into batch should succeed (intra-batch freshness)");
     let on_disk = std::fs::read_to_string(root.join("src/cfg.rs")).unwrap();
@@ -1323,6 +1335,7 @@ fn large_batch_applies_atomically_and_fresh() {
         edits,
         dry_run: false,
         undo: None,
+        run: None,
     })
     .expect("large chained batch should apply");
 
@@ -1366,6 +1379,7 @@ fn conflicting_same_symbol_edits_in_batch_roll_back() {
         ],
         dry_run: false,
         undo: None,
+        run: None,
     });
     assert!(
         res.is_err(),
@@ -1435,6 +1449,7 @@ fn move_into_readonly_dest_does_not_lose_the_symbol() {
         }],
         dry_run: false,
         undo: None,
+        run: None,
     });
     assert!(res.is_err(), "move into a read-only dest should fail");
     // CRITICAL: `mover` must NOT be lost — still in src.rs (the move aborted).
@@ -1467,6 +1482,7 @@ fn undo_into_readonly_file_is_refused_and_preserves_history() {
         edits: vec![],
         dry_run: false,
         undo: Some(1),
+        run: None,
     });
     assert!(res.is_err(), "undo into a read-only file should be refused");
 
@@ -1479,6 +1495,7 @@ fn undo_into_readonly_file_is_refused_and_preserves_history() {
         edits: vec![],
         dry_run: false,
         undo: Some(1),
+        run: None,
     });
     assert!(
         res2.is_ok(),
@@ -1530,6 +1547,7 @@ fn delete_and_move_carry_attributes_and_docs() {
         }],
         dry_run: false,
         undo: None,
+        run: None,
     })
     .unwrap();
     let a = std::fs::read_to_string(root.join("a.rs")).unwrap();
@@ -1671,6 +1689,7 @@ fn rename_can_be_path_scoped_for_monorepos() {
         }],
         dry_run: false,
         undo: None,
+        run: None,
     };
     eng.code_apply(&req).unwrap();
     let auth = std::fs::read_to_string(root.join("packages/auth/src/lib.rs")).unwrap();
@@ -1755,6 +1774,7 @@ fn rename_dry_run_reports_but_does_not_write() {
         }],
         dry_run: true,
         undo: None,
+        run: None,
     };
     let out = eng.code_apply(&req).unwrap();
     assert!(
@@ -1899,6 +1919,7 @@ fn deterministic_apply_writes_and_is_immediately_fresh() {
             }],
             dry_run: false,
             undo: None,
+            run: None,
         })
         .expect("apply should succeed with writes enabled");
     assert!(report.contains("@@"), "unified diff expected");
@@ -1950,6 +1971,7 @@ fn apply_into_container_writes_and_is_fresh() {
             }],
             dry_run: false,
             undo: None,
+            run: None,
         })
         .expect("@into apply should succeed with writes enabled");
     assert!(report.contains("written"), "should confirm write: {report}");
@@ -2000,6 +2022,7 @@ fn dry_run_does_not_write() {
             }],
             dry_run: true,
             undo: None,
+            run: None,
         })
         .unwrap();
     assert!(report.contains("dry_run"));
@@ -2027,6 +2050,7 @@ fn apply_rejects_parse_breaking_edit() {
             }],
             dry_run: false,
             undo: None,
+            run: None,
         })
         .unwrap_err();
     assert!(
@@ -2063,6 +2087,7 @@ fn writes_are_gated_when_not_allowed() {
             }],
             dry_run: false,
             undo: None,
+            run: None,
         })
         .unwrap_err();
     assert!(
@@ -2097,6 +2122,7 @@ fn sandbox_refuses_escape_and_sensitive_targets() {
                 }],
                 dry_run: false,
                 undo: None,
+                run: None,
             })
             .unwrap_err();
         assert!(
@@ -2129,6 +2155,7 @@ fn lazy_edit_is_not_silently_misapplied() {
             }],
             dry_run: false,
             undo: None,
+            run: None,
         })
         .unwrap_err();
     assert!(
@@ -2157,6 +2184,7 @@ fn audit_log_records_every_call() {
         }],
         dry_run: true,
         undo: None,
+        run: None,
     });
     let log = eng.audit_log();
     assert_eq!(log.len(), 2, "every code/code_apply call must be audited");
@@ -2606,6 +2634,7 @@ fn verify_hook_skipped_on_dry_run() {
         }],
         dry_run: true,
         undo: None,
+        run: None,
     };
     let out = eng.code_apply(&req).unwrap();
     assert!(
