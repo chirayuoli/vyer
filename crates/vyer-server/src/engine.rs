@@ -425,6 +425,11 @@ pub struct Engine {
     /// text of every file it touched (`None` = the file didn't exist). `undo`
     /// pops and restores — safe exploration for an agent.
     history: Mutex<Vec<EditBatch>>,
+    /// SCRY-143 (guiding master): signatures of edits that were just REJECTED (e.g.
+    /// failed the re-parse gate). If the agent resubmits the identical edit, vyer
+    /// warns it'll fail again instead of letting the agent burn the same mistake.
+    /// Bounded ring; an edit's signature is cleared once it finally succeeds.
+    rejected: Mutex<std::collections::VecDeque<String>>,
 }
 
 /// One undoable batch: the pre-edit text of each file it touched
@@ -438,6 +443,44 @@ const MAX_UNDO_BATCHES: usize = 256;
 /// SCRY-072: the in-memory audit log is bounded for the same reason (the `--audit`
 /// file, if configured, retains the full append-only record).
 const MAX_AUDIT_ENTRIES: usize = 10_000;
+
+/// SCRY-143: bound on the rejected-edit ring (the repeat-mistake guard).
+const MAX_REJECTED_SIGS: usize = 128;
+
+/// A stable signature for an edit (SCRY-143): its locator plus a hash of the op
+/// payload (new_body/anchor/replace/rename). Two requests that would make the
+/// SAME change share a signature, so a just-rejected edit is recognized if resent.
+fn edit_signature(e: &Edit) -> Option<String> {
+    let loc = e.locator.split(" :: ").next().unwrap_or(&e.locator).trim();
+    if loc.is_empty() {
+        return None;
+    }
+    let mut h: u64 = 0xcbf29ce484222325; // FNV-1a offset basis
+    let mut feed = |s: &str| {
+        for b in s.bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+    };
+    feed(loc);
+    if let Some(b) = &e.new_body {
+        feed("\u{1}nb");
+        feed(b);
+    }
+    if let Some(a) = &e.anchor {
+        feed("\u{1}an");
+        feed(a);
+    }
+    if let Some(r) = &e.replace {
+        feed("\u{1}rp");
+        feed(r);
+    }
+    if let Some(r) = &e.rename {
+        feed("\u{1}rn");
+        feed(r);
+    }
+    Some(format!("{loc}#{h:016x}"))
+}
 
 /// SCRY-073: the `exclude_seen` paging set is bounded; on overflow it resets a
 /// fresh paging cycle rather than grow unbounded across a long session.
@@ -486,6 +529,7 @@ impl Engine {
             token_index: Mutex::new(None),
             semantic_index: Mutex::new(None),
             history: Mutex::new(Vec::new()),
+            rejected: Mutex::new(std::collections::VecDeque::new()),
         };
         engine.index_repo()?;
         Ok(engine)
@@ -3410,6 +3454,21 @@ impl Engine {
             }
         }
 
+        // SCRY-143 (guiding master): recognize edits that were REJECTED earlier this
+        // session, so the agent doesn't burn the identical broken edit again.
+        let sigs: Vec<String> = req.edits.iter().filter_map(edit_signature).collect();
+        let repeat_note = {
+            let rej = self.rejected.lock().unwrap();
+            let n = sigs.iter().filter(|s| rej.contains(*s)).count();
+            (n > 0).then(|| {
+                format!(
+                    "repeat-mistake: {n} of these edit(s) were REJECTED earlier this session (failed \
+                     validation) — resubmitting an IDENTICAL edit will fail the same way; change the \
+                     body/anchor or fix the underlying cause first.\n"
+                )
+            })
+        };
+
         let result: Result<String, String> = (|| {
             let mut report = String::new();
             for e in &req.edits {
@@ -4116,6 +4175,12 @@ impl Engine {
                         ));
                     }
                 }
+                // SCRY-143: this batch validated → clear any prior REJECTED marks for
+                // these edits (the agent fixed the underlying cause).
+                if !sigs.is_empty() {
+                    let mut rej = self.rejected.lock().unwrap();
+                    rej.retain(|s| !sigs.contains(s));
+                }
                 // SCRY-031: post-apply verify (compiles/tests, not just parses).
                 if wrote {
                     if let Some(line) = self.run_verify() {
@@ -4136,7 +4201,25 @@ impl Engine {
                         }
                     }
                 }
-                Err(err)
+                // SCRY-143: remember these edits' signatures as REJECTED so an
+                // identical resubmission is flagged (guiding master). Bounded ring.
+                {
+                    let mut rej = self.rejected.lock().unwrap();
+                    for s in &sigs {
+                        if !rej.contains(s) {
+                            rej.push_back(s.clone());
+                        }
+                    }
+                    while rej.len() > MAX_REJECTED_SIGS {
+                        rej.pop_front();
+                    }
+                }
+                // Prepend the repeat-mistake warning if this exact edit was rejected
+                // before — so the agent learns it's looping on the same failure.
+                match repeat_note {
+                    Some(note) => Err(format!("{note}{err}")),
+                    None => Err(err),
+                }
             }
         }
     }
@@ -6674,6 +6757,7 @@ mod tests {
             token_index: Mutex::new(None),
             semantic_index: Mutex::new(None),
             history: Mutex::new(Vec::new()),
+            rejected: Mutex::new(std::collections::VecDeque::new()),
         };
         {
             let mut db = engine.db.lock().unwrap();
@@ -6725,6 +6809,7 @@ mod tests {
             token_index: Mutex::new(None),
             semantic_index: Mutex::new(None),
             history: Mutex::new(Vec::new()),
+            rejected: Mutex::new(std::collections::VecDeque::new()),
         };
         {
             let mut db = engine.db.lock().unwrap();
@@ -7182,6 +7267,7 @@ mod tests {
             token_index: Mutex::new(None),
             semantic_index: Mutex::new(None),
             history: Mutex::new(Vec::new()),
+            rejected: Mutex::new(std::collections::VecDeque::new()),
         };
         let info = engine.project_info();
         let _ = std::fs::remove_dir_all(&dir);
@@ -8353,6 +8439,34 @@ mod tests {
         // never a mutating/long-running default.
         assert!(!tasks.values().any(|v| v.join(" ").contains("fmt")));
         assert!(!tasks.contains_key("run"));
+    }
+
+    #[test]
+    fn repeat_rejected_edit_is_flagged() {
+        // SCRY-143 (guiding master): resubmitting an edit that was just rejected gets
+        // a repeat-mistake warning instead of silently looping on the same failure.
+        let mut engine = engine_with(&[("src/a.rs", "fn foo() {}\n")]);
+        engine.config.allow_writes = true;
+        let bad = || ApplyRequest {
+            edits: vec![Edit {
+                locator: "src/a.rs#foo".into(),
+                new_body: Some("fn foo( {".into()), // does not parse
+                ..Default::default()
+            }],
+            dry_run: false,
+            undo: None,
+            run: None,
+        };
+        let e1 = engine.code_apply(&bad()).unwrap_err();
+        assert!(
+            !e1.contains("repeat-mistake"),
+            "the FIRST failure is not a repeat: {e1}"
+        );
+        let e2 = engine.code_apply(&bad()).unwrap_err();
+        assert!(
+            e2.contains("repeat-mistake"),
+            "an identical re-submission must be flagged: {e2}"
+        );
     }
 
     #[test]
