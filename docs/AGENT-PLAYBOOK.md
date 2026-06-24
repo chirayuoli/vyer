@@ -87,30 +87,51 @@ file tools whenever the target is inside the repo. Returned code is `source=UNTR
 - **After a write** you immediately get a fresh read (staleness = 0). If `--verify` is
   set and fails, the edit IS written — `undo:1` to revert.
 
-## Fix build & test errors
-- **After running the build or tests** (via your shell), paste the compiler/test/stack-trace output into
-  `code` with `mode:"diagnose"`: `{ q:"<paste the error output>", mode:"diagnose" }`. Vyer finds every
-  `file:line` it references (rustc, tsc, dart, pytest, jest, go, …) and returns each as the **enclosing
-  symbol's locator** + a short window with the failing line marked `>>` — best-at-the-edges, root cause
-  first. Then `code_apply` the fix by that locator. Closes the run → error → fix loop without hand-reading
-  each `file:line`. (Files outside the index — deps/generated — are honestly flagged, not silently dropped.)
+## Run, build & test — close the loop in-tool
+- **Run a task** → `code_apply { run:"test" }` (or `build`/`lint`/`check`). Executes an
+  OPERATOR-allowlisted task and returns **structured diagnostics** directly: `file:line
+  SEVERITY :: message`. You pick a task NAME only (never a command) — gated by `--allow-run`.
+  Read `vyer://status` for the available task names. This is the front-half of the loop:
+  edit → `run` → read the structured failures → fix, without ever leaving the tool.
+- **Or paste output you already have** → `{ q:"<compiler/test/stack-trace>", mode:"diagnose" }`.
+  Vyer finds every `file:line` it references (rustc, tsc, dart, pytest, jest, go, …) and returns
+  each as the **enclosing symbol's locator** + a window with the failing line marked `>>` — root
+  cause first. Then `code_apply` the fix by that locator. (Files outside the index — deps/generated
+  — are honestly flagged, not silently dropped.)
 
 ## Be efficient
 - **Batch** independent questions: `{ queries:[{q:"login"},{q:"logout"}] }` (one call;
-  a `per-query found:` note tells you which matched; overlapping spans are deduped).
+  a `per-query found:` note tells you which matched; overlapping spans are deduped). Each
+  query gets a **fair share** of the budget, so one broad query can't starve its batch-mates.
+- **One query, no ceremony**: send `{ q:"foo" }` or a bare string — no need to wrap a single
+  query in `queries:[…]`. Same for edits: `{ locator:"…", new_body:"…" }` needs no `edits:[…]`.
 - **Page** through more results: set `exclude_seen:true` and re-issue to get the next
   unseen matches. Tune `k` for more/fewer results per query (default 8) — e.g. `k:30`
   for a broad survey, `k:3` for the single best hit.
 - **Budget** the output: `budget_tokens` caps the response; results are edge-ordered
   (best first and last) and truncation always leaves an actionable note.
 
+## Guardrails (the tool catches your mistakes; all overridable with `force:true`)
+- **Delete a symbol** → `{ locator:"PATH#@delete:sym" }` is **refused if `sym` still has
+  references** (the dead-code/break-callers mistake) — the sites are named. Update callers
+  first, or `force:true`.
+- **Rename** → refused if the new name **already exists** as a symbol (would merge two) — the
+  clashing sites are named. Pick a free name, scope with `path_scope`, or `force:true`.
+- **Replace a body** (`new_body`) → the report appends a **blast-radius** line (caller count +
+  sites), shown on `dry_run` too — so you see what you'd break BEFORE committing.
+- **Resubmit a rejected edit** → if you resend an edit that just failed validation, you're told
+  it'll fail the same way (`repeat-mistake: …`) instead of looping on it. Fix the cause first.
+
 ## When something fails
-- `PATTERN_NO_MATCH` → the hint is tailored (try `mode=structural` for an exact name,
-  `mode=semantic` for a concept, widen `path_scope`, drop `lang`).
-- A typo'd `mode`/`detail` → you get a note (`unknown mode X — used auto; valid: …`).
+- **Unsure of the call shape or what's available?** → `{ detail:"help" }` returns the full live
+  schema + a worked example per mode/op (authoritative — don't guess against prose).
+- `PATTERN_NO_MATCH` → the hint is tailored; a **typo'd identifier auto-recovers** to the nearest
+  symbols ("did you mean …?") so you self-correct in one call.
+- `SCOPE_NO_MATCH` → a positive `path_scope` matched 0 files (the FILTER, not the pattern) — widen
+  or drop it. (A plain entry like `config.dart` matches by basename/subpath.)
+- A typo'd `mode`/`detail` → a note lists the valid values (incl. `diagnose`, `import`, `help`).
 - An apply error names the cause and, for a missing symbol, lists the file's symbols.
-- A stale locator (the symbol changed since you read it) is refused — re-query for a
-  fresh one.
+- A stale locator (the symbol changed since you read it) is refused — re-query for a fresh one.
 
 ---
 Honest limits: the graph (`refs`/`context`/`impact`) is a precise lexical/tree-sitter
