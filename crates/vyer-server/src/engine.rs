@@ -436,6 +436,10 @@ pub struct Engine {
     /// warns it'll fail again instead of letting the agent burn the same mistake.
     /// Bounded ring; an edit's signature is cleared once it finally succeeds.
     rejected: Mutex<std::collections::VecDeque<String>>,
+    /// SCRY-145: the last diagnostics set per verify/run task label, so the NEXT run
+    /// can report the DELTA (introduced/fixed) — "what did this edit change". The
+    /// compiler is the semantic oracle; this is the type-resolved delta without LSP.
+    diag_baseline: Mutex<HashMap<String, std::collections::BTreeSet<String>>>,
 }
 
 /// One undoable batch: the pre-edit text of each file it touched
@@ -536,6 +540,7 @@ impl Engine {
             semantic_index: Mutex::new(None),
             history: Mutex::new(Vec::new()),
             rejected: Mutex::new(std::collections::VecDeque::new()),
+            diag_baseline: Mutex::new(HashMap::new()),
         };
         engine.index_repo()?;
         Ok(engine)
@@ -3151,14 +3156,18 @@ impl Engine {
         let Some((prog, args)) = argv.split_first() else {
             return format!("{kind}: empty command (operator misconfiguration)\n");
         };
-        match std::process::Command::new(prog)
+        let output = std::process::Command::new(prog)
             .args(args)
             .current_dir(&self.config.root)
-            .output()
-        {
+            .output();
+        // Build the base report AND the current diagnostic set (empty on success).
+        let (mut report, current): (String, std::collections::BTreeSet<String>) = match output {
             Ok(o) if o.status.success() => {
                 self.record(kind, format!("{label} ok"));
-                format!("{kind}({label})=ok\n")
+                (
+                    format!("{kind}({label})=ok\n"),
+                    std::collections::BTreeSet::new(),
+                )
             }
             Ok(o) => {
                 let err = String::from_utf8_lossy(&o.stderr);
@@ -3170,7 +3179,8 @@ impl Engine {
                 // not a single hand-picked error line.
                 let combined = format!("{err}\n{out}");
                 let diags = parse_diagnostics(&combined);
-                let mut report = String::new();
+                let mut r = String::new();
+                let mut set = std::collections::BTreeSet::new();
                 if diags.is_empty() {
                     // No file:line refs parsed — fall back to the first error-ish line.
                     let pick = err
@@ -3187,15 +3197,15 @@ impl Engine {
                         })
                         .unwrap_or("(no output)")
                         .trim();
-                    report.push_str(&format!("{kind}({label})=FAILED: {pick}\n"));
+                    r.push_str(&format!("{kind}({label})=FAILED: {pick}\n"));
                 } else {
                     let shown = diags.len().min(10);
-                    report.push_str(&format!(
+                    r.push_str(&format!(
                         "{kind}({label})=FAILED: {} diagnostic(s) (showing {shown})\n",
                         diags.len()
                     ));
                     for d in diags.iter().take(10) {
-                        report.push_str(&format!(
+                        r.push_str(&format!(
                             "  {}:{} {} :: {}\n",
                             d.path,
                             d.line,
@@ -3203,14 +3213,52 @@ impl Engine {
                             d.message.as_deref().unwrap_or("(see output)")
                         ));
                     }
-                    report.push_str(
+                    for d in &diags {
+                        set.insert(format!(
+                            "{}:{}:{}",
+                            d.path,
+                            d.line,
+                            d.message.as_deref().unwrap_or("")
+                        ));
+                    }
+                    r.push_str(
                         "  → paste the build output into `code` mode=diagnose for enclosing symbols + code windows\n",
                     );
                 }
-                report
+                (r, set)
             }
-            Err(e) => format!("{kind}({label})=ERROR: could not run `{label}` ({e})\n"),
+            // A spawn failure is not a diagnostics state — return without touching the
+            // baseline so it doesn't poison the next delta.
+            Err(e) => return format!("{kind}({label})=ERROR: could not run `{label}` ({e})\n"),
+        };
+
+        // SCRY-145: diagnostics DELTA vs the PREVIOUS run of this same task — the
+        // "what did THIS edit change" report (introduced / fixed). The compiler is the
+        // semantic oracle, so this is the type-resolved delta WITHOUT an LSP — and
+        // it's CI-testable with any verify command. The first run has no baseline.
+        {
+            let mut base = self.diag_baseline.lock().unwrap();
+            if let Some(prev) = base.get(&label) {
+                let introduced: Vec<&String> = current.difference(prev).collect();
+                let fixed = prev.difference(&current).count();
+                if !introduced.is_empty() || fixed > 0 {
+                    report.push_str(&format!(
+                        "  Δ vs previous {kind}: +{} introduced, -{} fixed\n",
+                        introduced.len(),
+                        fixed
+                    ));
+                    for s in introduced.iter().take(5) {
+                        report.push_str(&format!("    + {s}\n"));
+                    }
+                    if current.is_empty() && fixed > 0 {
+                        report
+                            .push_str("    (now clean — your edits fixed the remaining issues)\n");
+                    }
+                }
+            }
+            base.insert(label.clone(), current);
         }
+        report
     }
 
     fn run_verify(&self) -> Option<String> {
@@ -5780,6 +5828,8 @@ EDIT — code_apply (gated by --allow-writes; NO prior Read needed; bytes never 
                       (build/test/lint) and returns STRUCTURED diagnostics
                       (file:line severity :: message). Closes edit→test→fix. You pick
                       a task NAME only (never a command); gated by --allow-run.
+                      Re-running the SAME task reports the DELTA vs last time
+                      (+introduced / -fixed) — what your edits changed.
   GUARDRAILS (guiding master; all overridable with \"force\":true):
    • @delete:SYM is REFUSED if SYM still has references (names the sites).
    • rename onto an EXISTING symbol name is REFUSED (would merge two symbols).
@@ -6777,6 +6827,7 @@ mod tests {
             semantic_index: Mutex::new(None),
             history: Mutex::new(Vec::new()),
             rejected: Mutex::new(std::collections::VecDeque::new()),
+            diag_baseline: Mutex::new(HashMap::new()),
         };
         {
             let mut db = engine.db.lock().unwrap();
@@ -6829,6 +6880,7 @@ mod tests {
             semantic_index: Mutex::new(None),
             history: Mutex::new(Vec::new()),
             rejected: Mutex::new(std::collections::VecDeque::new()),
+            diag_baseline: Mutex::new(HashMap::new()),
         };
         {
             let mut db = engine.db.lock().unwrap();
@@ -7287,6 +7339,7 @@ mod tests {
             semantic_index: Mutex::new(None),
             history: Mutex::new(Vec::new()),
             rejected: Mutex::new(std::collections::VecDeque::new()),
+            diag_baseline: Mutex::new(HashMap::new()),
         };
         let info = engine.project_info();
         let _ = std::fs::remove_dir_all(&dir);
@@ -8458,6 +8511,41 @@ mod tests {
         // never a mutating/long-running default.
         assert!(!tasks.values().any(|v| v.join(" ").contains("fmt")));
         assert!(!tasks.contains_key("run"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_reports_diagnostics_delta() {
+        // SCRY-145: a second run of the same task reports the DELTA vs the first —
+        // introduced/fixed — the "what did this edit change" semantic feedback,
+        // sourced from the real tool (here a stub script standing in for a compiler).
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("vyer_delta_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("diag.sh");
+        std::fs::write(&script, "#!/bin/sh\ncat diag.txt\nexit 1\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(dir.join("diag.txt"), "src/a.rs:10: error: boom\n").unwrap();
+        let mut cfg = EngineConfig::new(dir.clone());
+        cfg.allow_run = true;
+        cfg.run_tasks.insert("d".into(), vec!["./diag.sh".into()]);
+        let engine = Engine::new(cfg).unwrap();
+        let r1 = engine.code_run("d").unwrap();
+        assert!(
+            r1.contains("boom") && !r1.contains("Δ"),
+            "first run sets the baseline, no delta: {r1}"
+        );
+        std::fs::write(dir.join("diag.txt"), "src/b.rs:22: error: kaboom\n").unwrap();
+        let r2 = engine.code_run("d").unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            r2.contains("Δ vs previous run")
+                && r2.contains("+1 introduced")
+                && r2.contains("-1 fixed"),
+            "second run reports the delta: {r2}"
+        );
+        assert!(r2.contains("kaboom"), "{r2}");
     }
 
     #[test]
