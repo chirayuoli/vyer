@@ -2166,36 +2166,69 @@ impl Engine {
     fn external_refs(&self, db: &Db, name: &str, def_file: &str) -> Vec<(String, u32)> {
         let _ = def_file; // kept for API symmetry / future type-scoping (Phase 2)
         let pattern = format!(r"\b{}\b", regex_escape_ident(name));
-        let mut out: Vec<(String, u32)> = Vec::new();
-        for f in db.files() {
-            let text = match db.text(&f) {
-                Some(t) => t,
-                None => continue,
-            };
-            if !text.contains(name) {
-                continue; // cheap prune over resident text
-            }
-            // SCRY-146: a same-named symbol's DEFINITION line — in ANY file, not just
-            // the def file — is not a *reference* to this symbol. Excluding them in
-            // every file (consistent with refs_spans) removes a class of lexical
-            // false positives that inflated blast-radius / safe-delete counts in
-            // monorepos where a name (`handler`, `config`) recurs as distinct symbols.
-            let def_lines: Vec<u32> = db
-                .symbols(&f)
-                .symbols
-                .iter()
-                .filter(|s| s.name == name)
-                .map(|s| s.start)
-                .collect();
-            let flang = vyer_incr::detect_lang(&f);
-            let code_lines = code_ident_lines(&text, name, flang);
-            for hit in lexical::search_text(&text, &pattern, 200) {
-                if def_lines.contains(&hit.line) || !code_lines.contains(&hit.line) {
-                    continue;
+        // Gather the per-file work items SEQUENTIALLY (this is where the warm core /
+        // Db is read — Arc<str> text + symbol table). The CPU-heavy regex scan below
+        // then runs over OWNED data with no Db borrow, so it can be parallelized.
+        // SCRY-146: a same-named symbol's DEFINITION line — in ANY file — is not a
+        // reference, so it's excluded (consistent with refs_spans).
+        type Item = (String, std::sync::Arc<str>, Vec<u32>, vyer_incr::Lang);
+        let items: Vec<Item> = db
+            .files()
+            .into_iter()
+            .filter_map(|f| {
+                let text = db.text(&f)?;
+                if !text.contains(name) {
+                    return None; // cheap prune over resident text
                 }
-                out.push((f.clone(), hit.line));
+                let def_lines: Vec<u32> = db
+                    .symbols(&f)
+                    .symbols
+                    .iter()
+                    .filter(|s| s.name == name)
+                    .map(|s| s.start)
+                    .collect();
+                let flang = vyer_incr::detect_lang(&f);
+                Some((f, text, def_lines, flang))
+            })
+            .collect();
+
+        // The pure per-file scan — no Db, no shared state — so it's safe to fan out.
+        let scan = |it: &Item| -> Vec<(String, u32)> {
+            let (path, text, def_lines, flang) = it;
+            let code_lines = code_ident_lines(text, name, *flang);
+            let mut v = Vec::new();
+            for hit in lexical::search_text(text, &pattern, 200) {
+                if !def_lines.contains(&hit.line) && code_lines.contains(&hit.line) {
+                    v.push((path.clone(), hit.line));
+                }
             }
-        }
+            v
+        };
+
+        // SCRY-153: MULTITHREAD the scan on a large repo ("wayyy faster"), but stay
+        // sequential for small inputs so thread setup doesn't cost more than it saves
+        // ("keep resources down"). Determinism (Rule §9) is preserved by the final
+        // sort — the parallel merge order never reaches the output.
+        const PAR_THRESHOLD: usize = 64;
+        let mut out: Vec<(String, u32)> = if items.len() < PAR_THRESHOLD {
+            items.iter().flat_map(&scan).collect()
+        } else {
+            let threads = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+                .clamp(2, 8);
+            let chunk = items.len().div_ceil(threads);
+            std::thread::scope(|s| {
+                items
+                    .chunks(chunk)
+                    .map(|c| s.spawn(|| c.iter().flat_map(&scan).collect::<Vec<_>>()))
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .flat_map(|h| h.join().unwrap_or_default())
+                    .collect()
+            })
+        };
+        out.sort();
         out
     }
 
@@ -8915,6 +8948,42 @@ mod tests {
         assert!(
             out.contains("src/b.rs"),
             "the lexical reference is preserved: {out}"
+        );
+    }
+
+    #[test]
+    fn external_refs_parallel_path_counts_correctly() {
+        // SCRY-153: >PAR_THRESHOLD (64) files exercise the multithreaded scan; the
+        // count must be exact (determinism/correctness preserved across the fan-out).
+        let mut owned: Vec<(String, String)> =
+            vec![("src/a.rs".to_string(), "pub fn helper() {}\n".to_string())];
+        for i in 0..70 {
+            owned.push((
+                format!("src/u{i}.rs"),
+                "fn use_it() {\n    helper()\n}\n".to_string(),
+            ));
+        }
+        let files: Vec<(&str, &str)> = owned
+            .iter()
+            .map(|(p, c)| (p.as_str(), c.as_str()))
+            .collect();
+        let mut engine = engine_with(&files);
+        engine.config.allow_writes = true;
+        let out = engine
+            .code_apply(&ApplyRequest {
+                edits: vec![Edit {
+                    locator: "src/a.rs#helper".into(),
+                    new_body: Some("pub fn helper() { let _x = 1; }".into()),
+                    ..Default::default()
+                }],
+                dry_run: true,
+                undo: None,
+                run: None,
+            })
+            .unwrap();
+        assert!(
+            out.contains("blast-radius") && out.contains("70 reference"),
+            "parallel scan must count all 70 refs: {out}"
         );
     }
 
