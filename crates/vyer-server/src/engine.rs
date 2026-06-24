@@ -3924,8 +3924,54 @@ impl Engine {
                 if !originals.is_empty() {
                     self.record_history(originals.into_iter().collect());
                 }
-                // SCRY-031: post-apply verify (compiles/tests, not just parses).
                 let mut report = report;
+                // SCRY-138 (guiding master): blast-radius note. When an edit REPLACES
+                // a symbol's body (new_body) — the change most likely to alter
+                // behavior/signature and break callers — append how many references
+                // it has so the agent verifies them. The warm graph gives this for
+                // free; an agent would otherwise reconstruct it by hand or skip it
+                // and regress. graph=partial(approx).
+                for e in &req.edits {
+                    if e.new_body.is_none() {
+                        continue;
+                    }
+                    let raw = e.locator.split(" :: ").next().unwrap_or(&e.locator).trim();
+                    let Some((p, t)) = raw.split_once('#') else {
+                        continue;
+                    };
+                    if t.starts_with('@') {
+                        continue; // authoring directive, not a symbol-body replace
+                    }
+                    let symfull = t.split('@').next().unwrap_or(t);
+                    let sym = symfull
+                        .rsplit(['.', ':'])
+                        .next()
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(symfull);
+                    let Some(def_file) = self.resolve_indexed_path(&db, p) else {
+                        continue;
+                    };
+                    let refs = self.external_refs(&db, sym, &def_file);
+                    if !refs.is_empty() {
+                        let shown: Vec<String> = refs
+                            .iter()
+                            .take(5)
+                            .map(|(f, l)| format!("{f}:{l}"))
+                            .collect();
+                        let more = refs.len().saturating_sub(shown.len());
+                        let tail = if more > 0 {
+                            format!(", +{more} more")
+                        } else {
+                            String::new()
+                        };
+                        report.push_str(&format!(
+                            "  blast-radius: `{sym}` has {} reference(s) (graph=partial) — verify callers still hold: {}{tail}\n",
+                            refs.len(),
+                            shown.join(", ")
+                        ));
+                    }
+                }
+                // SCRY-031: post-apply verify (compiles/tests, not just parses).
                 if wrote {
                     if let Some(line) = self.run_verify() {
                         report.push_str(&line);
@@ -8053,6 +8099,32 @@ mod tests {
         let err = engine.code_apply(&req).unwrap_err();
         assert!(err.contains("locator"), "{err}");
         assert!(err.contains("PATH#SYMBOL"), "explains the format: {err}");
+    }
+
+    #[test]
+    fn new_body_edit_reports_blast_radius() {
+        // SCRY-138 (guiding master): replacing a symbol's body surfaces its callers
+        // so the agent verifies them (catches the changed-signature/broke-callers
+        // mistake before it ships).
+        let mut engine = engine_with(&[
+            ("src/a.rs", "pub fn helper() -> i32 {\n    1\n}\n"),
+            ("src/b.rs", "fn use_it() -> i32 {\n    helper()\n}\n"),
+        ]);
+        engine.config.allow_writes = true;
+        let req = ApplyRequest {
+            edits: vec![Edit {
+                locator: "src/a.rs#helper".into(),
+                new_body: Some("pub fn helper() -> i32 {\n    2\n}".into()),
+                ..Default::default()
+            }],
+            dry_run: true,
+            undo: None,
+        };
+        let out = engine.code_apply(&req).expect("edit ok");
+        assert!(
+            out.contains("blast-radius") && out.contains("helper") && out.contains("src/b.rs"),
+            "should surface callers of the edited symbol: {out}"
+        );
     }
 
     #[test]
