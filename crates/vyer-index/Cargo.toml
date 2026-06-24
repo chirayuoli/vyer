@@ -6,7 +6,7 @@ description = "Real parsing for Vyer: tree-sitter grammars (Rust/Python/JS/TS/Go
 
 [dependencies]
 vyer-incr = { path = "../vyer-incr" }
-tree-sitter = "0.25"
+tree-sitter = "0.26"
 streaming-iterator = "0.1"
 tree-sitter-rust = "0.24"
 tree-sitter-python = "0.23"
