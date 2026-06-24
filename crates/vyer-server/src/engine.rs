@@ -3513,6 +3513,28 @@ impl Engine {
             }
         }
 
+        // SCRY-147 (guiding master): refuse editing a GENERATED file (*.g.dart,
+        // *.pb.*, *_pb2.py, **/generated/**, …) — codegen will overwrite the change,
+        // so the agent is editing the wrong artifact. Point it at the source/template.
+        // force:true overrides (the rare hand-tweak). Skips glob/`@new` locators.
+        for e in &req.edits {
+            if e.force {
+                continue;
+            }
+            let raw = e.locator.split(" :: ").next().unwrap_or(&e.locator).trim();
+            let path = raw.split_once('#').map(|(p, _)| p).unwrap_or(raw);
+            if path.is_empty() || path.contains('*') {
+                continue; // bulk glob handled per-file elsewhere
+            }
+            if is_generated(path) && self.resolve_indexed_path(&db, path).is_some() {
+                return Err(format!(
+                    "refusing to edit `{path}`: it looks GENERATED (codegen will overwrite your \
+                     change) — edit the source/template that produces it instead, then re-run \
+                     codegen. Pass force:true if you really mean to hand-edit it."
+                ));
+            }
+        }
+
         // SCRY-143 (guiding master): recognize edits that were REJECTED earlier this
         // session, so the agent doesn't burn the identical broken edit again.
         let sigs: Vec<String> = req.edits.iter().filter_map(edit_signature).collect();
@@ -8734,6 +8756,39 @@ mod tests {
             exclude_seen: false,
         };
         assert!(engine.code(&req2).contains("PATTERN_NO_MATCH"));
+    }
+
+    #[test]
+    fn editing_a_generated_file_is_refused() {
+        // SCRY-147 (guiding master): codegen will overwrite a generated file, so
+        // editing it is a wasted/wrong change — refuse, force-overridable.
+        let mut engine = engine_with(&[("lib/model.g.dart", "class M {}\n")]);
+        engine.config.allow_writes = true;
+        let mk = |force: bool| ApplyRequest {
+            edits: vec![Edit {
+                locator: "lib/model.g.dart#M".into(),
+                new_body: Some("class M { int x = 1; }".into()),
+                force,
+                ..Default::default()
+            }],
+            dry_run: true,
+            undo: None,
+            run: None,
+        };
+        let err = engine.code_apply(&mk(false)).unwrap_err();
+        assert!(
+            err.contains("GENERATED") && err.contains("model.g.dart"),
+            "{err}"
+        );
+        let forced = engine.code_apply(&mk(true));
+        let refused = forced
+            .as_ref()
+            .err()
+            .is_some_and(|e| e.contains("looks GENERATED"));
+        assert!(
+            !refused,
+            "force:true overrides the generated-file guard: {forced:?}"
+        );
     }
 
     #[test]
