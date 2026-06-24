@@ -121,6 +121,12 @@ fn build_engine(args: &[String]) -> Result<Engine, String> {
     // (repeatable) registers an OPERATOR allowlist of named tasks the agent may run
     // BY NAME (never a command string — Rule §3). e.g. --run test="cargo test -q".
     cfg.allow_run = has(args, "--allow-run");
+    // SCRY-141: when run is enabled, seed a SAFE default allowlist from the repo's
+    // manifests (build/test/lint/check) so `--allow-run` alone works zero-config.
+    if cfg.allow_run {
+        cfg.run_tasks = vyer_server::engine::derive_run_tasks(&cfg.root);
+    }
+    // Explicit `--run NAME="<cmd>"` overrides/augments the derived defaults.
     for spec in multi_flag(args, "--run") {
         if let Some((name, cmd)) = spec.split_once('=') {
             let argv: Vec<String> = cmd.split_whitespace().map(|w| w.to_string()).collect();

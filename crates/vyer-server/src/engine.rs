@@ -6033,6 +6033,69 @@ fn enclosing(syms: &vyer_incr::SymbolTable, line: u32) -> (Option<String>, u32, 
 ///   `src/a.rs:42:10` · `lib/a.dart:42:5` · `./a.go:42` · `a.ts(42,10)` ·
 ///   `File "a.py", line 42` · `at f (src/a.js:42:10)`
 /// Deduped, in first-seen order (the first reference is usually the root cause).
+/// SCRY-141: auto-derive a `code_run` task allowlist from the repo's manifests, so
+/// `--allow-run` alone gives the agent a working build/test/lint loop (zero config).
+/// Only SAFE, non-mutating tasks (build/check/test/lint/analyze/vet) — never `fmt`
+/// (mutates) or `run`/serve (long-running). Operator-gated regardless (it's only
+/// consulted when --allow-run is set); the agent still selects a task by NAME, so
+/// Rule §3 holds. First stack wins on a name collision; explicit --run overrides.
+pub fn derive_run_tasks(root: &Path) -> std::collections::BTreeMap<String, Vec<String>> {
+    let mut tasks: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    let exists = |n: &str| root.join(n).exists();
+    let argv = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
+    let mut add = |name: &str, cmd: &str| {
+        tasks.entry(name.to_string()).or_insert_with(|| argv(cmd));
+    };
+    if exists("Cargo.toml") {
+        add("check", "cargo check");
+        add("test", "cargo test");
+        add("lint", "cargo clippy");
+        add("build", "cargo build");
+    }
+    if exists("go.mod") {
+        add("build", "go build ./...");
+        add("test", "go test ./...");
+        add("lint", "go vet ./...");
+    }
+    if exists("pubspec.yaml") {
+        let dart = std::fs::read_to_string(root.join("pubspec.yaml")).unwrap_or_default();
+        let t = if dart.contains("sdk: flutter") || dart.contains("\nflutter:") {
+            "flutter"
+        } else {
+            "dart"
+        };
+        add("test", &format!("{t} test"));
+        add("lint", "dart analyze");
+    }
+    if exists("pyproject.toml") || exists("setup.py") || exists("requirements.txt") {
+        add("test", "pytest");
+    }
+    if exists("package.json") {
+        // Only wire scripts that actually exist, so a task never fails as "missing
+        // script". `npm test`/`npm run X` are stable entry points.
+        if let Ok(pkg) = std::fs::read_to_string(root.join("package.json")) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&pkg) {
+                let scripts = v.get("scripts").and_then(|s| s.as_object());
+                let has = |k: &str| scripts.is_some_and(|m| m.contains_key(k));
+                if has("test") {
+                    add("test", "npm test");
+                }
+                if has("build") {
+                    add("build", "npm run build");
+                }
+                if has("lint") {
+                    add("lint", "npm run lint");
+                }
+                if has("typecheck") {
+                    add("check", "npm run typecheck");
+                }
+            }
+        }
+    }
+    tasks
+}
+
 /// A parsed diagnostic (SCRY-133): WHERE (path+line) plus best-effort WHAT
 /// (severity + message). severity/message are absent for formats that don't carry
 /// them on the location line (e.g. a Python traceback frame). This is the
@@ -8235,6 +8298,30 @@ mod tests {
         let err = engine.code_apply(&req).unwrap_err();
         assert!(err.contains("locator"), "{err}");
         assert!(err.contains("PATH#SYMBOL"), "explains the format: {err}");
+    }
+
+    #[test]
+    fn derive_run_tasks_seeds_safe_defaults() {
+        // SCRY-141: --allow-run alone yields a safe build/test/lint allowlist from
+        // the manifests, never a mutating task (fmt) or a long-running one (run).
+        let dir = std::env::temp_dir().join(format!("vyer_runtasks_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+        let tasks = derive_run_tasks(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            tasks.get("test").map(|v| v.join(" ")).as_deref(),
+            Some("cargo test")
+        );
+        assert_eq!(
+            tasks.get("lint").map(|v| v.join(" ")).as_deref(),
+            Some("cargo clippy")
+        );
+        assert!(tasks.contains_key("check") && tasks.contains_key("build"));
+        // never a mutating/long-running default.
+        assert!(!tasks.values().any(|v| v.join(" ").contains("fmt")));
+        assert!(!tasks.contains_key("run"));
     }
 
     #[test]
