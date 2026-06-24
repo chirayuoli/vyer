@@ -2140,14 +2140,8 @@ impl Engine {
     /// symbol elsewhere counts conservatively (better to refuse a delete than
     /// silently break callers); `force:true` overrides.
     fn external_refs(&self, db: &Db, name: &str, def_file: &str) -> Vec<(String, u32)> {
+        let _ = def_file; // kept for API symmetry / future type-scoping (Phase 2)
         let pattern = format!(r"\b{}\b", regex_escape_ident(name));
-        let def_lines: Vec<u32> = db
-            .symbols(def_file)
-            .symbols
-            .iter()
-            .filter(|s| s.name == name)
-            .map(|s| s.start)
-            .collect();
         let mut out: Vec<(String, u32)> = Vec::new();
         for f in db.files() {
             let text = match db.text(&f) {
@@ -2157,11 +2151,22 @@ impl Engine {
             if !text.contains(name) {
                 continue; // cheap prune over resident text
             }
+            // SCRY-146: a same-named symbol's DEFINITION line — in ANY file, not just
+            // the def file — is not a *reference* to this symbol. Excluding them in
+            // every file (consistent with refs_spans) removes a class of lexical
+            // false positives that inflated blast-radius / safe-delete counts in
+            // monorepos where a name (`handler`, `config`) recurs as distinct symbols.
+            let def_lines: Vec<u32> = db
+                .symbols(&f)
+                .symbols
+                .iter()
+                .filter(|s| s.name == name)
+                .map(|s| s.start)
+                .collect();
             let flang = vyer_incr::detect_lang(&f);
             let code_lines = code_ident_lines(&text, name, flang);
             for hit in lexical::search_text(&text, &pattern, 200) {
-                let is_own_def = f == def_file && def_lines.contains(&hit.line);
-                if is_own_def || !code_lines.contains(&hit.line) {
+                if def_lines.contains(&hit.line) || !code_lines.contains(&hit.line) {
                     continue;
                 }
                 out.push((f.clone(), hit.line));
@@ -8729,6 +8734,35 @@ mod tests {
             exclude_seen: false,
         };
         assert!(engine.code(&req2).contains("PATTERN_NO_MATCH"));
+    }
+
+    #[test]
+    fn same_named_def_elsewhere_is_not_a_reference() {
+        // SCRY-146: deleting `helper` in a.rs must NOT be blocked by an UNRELATED
+        // same-named `helper` DEFINED in b.rs — its definition line is not a
+        // reference (a lexical false positive the precision fix removes).
+        let mut engine = engine_with(&[
+            ("src/a.rs", "fn helper() {}\n"),
+            ("src/b.rs", "fn helper() {}\n"),
+        ]);
+        engine.config.allow_writes = true;
+        let out = engine.code_apply(&ApplyRequest {
+            edits: vec![Edit {
+                locator: "src/a.rs#@delete:helper".into(),
+                ..Default::default()
+            }],
+            dry_run: true,
+            undo: None,
+            run: None,
+        });
+        let refused = out
+            .as_ref()
+            .err()
+            .is_some_and(|e| e.contains("refusing to delete"));
+        assert!(
+            !refused,
+            "a same-named definition elsewhere is not a reference: {out:?}"
+        );
     }
 
     #[test]
