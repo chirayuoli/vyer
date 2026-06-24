@@ -378,10 +378,19 @@ mod langpack {
 (mod_item name: (_) @name) @def.mod
 (macro_definition name: (_) @name) @def.macro
 (impl_item) @def.impl
+(field_declaration name: (field_identifier) @name) @def.field
+(enum_variant name: (identifier) @name) @def.variant
+(const_item name: (identifier) @name) @def.const
+(static_item name: (identifier) @name) @def.const
 "#;
+    // Class-body and module-level assignments only (via nesting) so we index
+    // class attributes + module constants WITHOUT capturing every function-local
+    // variable (that would replace the god-class problem with index noise).
     const PYTHON_TAGS: &str = r#"
 (function_definition name: (_) @name) @def.def
 (class_definition name: (_) @name) @def.class
+(class_definition body: (block (expression_statement (assignment left: (identifier) @name)) @def.field))
+(module (expression_statement (assignment left: (identifier) @name)) @def.const)
 "#;
     const JS_TAGS: &str = r#"
 (function_declaration name: (_) @name) @def.function
@@ -390,6 +399,9 @@ mod langpack {
 (method_definition name: (_) @name) @def.function
 (lexical_declaration (variable_declarator name: (_) @name value: (arrow_function))) @def.function
 (lexical_declaration (variable_declarator name: (_) @name value: (function_expression))) @def.function
+(field_definition property: (_) @name) @def.field
+(export_statement (lexical_declaration (variable_declarator name: (identifier) @name))) @def.const
+(program (lexical_declaration (variable_declarator name: (identifier) @name)) @def.const)
 "#;
     const TS_TAGS: &str = r#"
 (function_declaration name: (_) @name) @def.function
@@ -400,11 +412,18 @@ mod langpack {
 (type_alias_declaration name: (_) @name) @def.type
 (method_definition name: (_) @name) @def.function
 (lexical_declaration (variable_declarator name: (_) @name value: (arrow_function))) @def.function
+(public_field_definition name: (property_identifier) @name) @def.field
+(property_signature name: (property_identifier) @name) @def.field
+(enum_body (property_identifier) @name @def.variant)
+(export_statement (lexical_declaration (variable_declarator name: (identifier) @name))) @def.const
+(program (lexical_declaration (variable_declarator name: (identifier) @name)) @def.const)
 "#;
     const GO_TAGS: &str = r#"
 (function_declaration name: (_) @name) @def.func
 (method_declaration name: (_) @name) @def.func
 (type_spec name: (_) @name) @def.type
+(field_declaration name: (field_identifier) @name) @def.field
+(const_spec name: (identifier) @name) @def.const
 "#;
     // tree-sitter-dart 0.2.x exposes `name:` fields and Dart 3 node kinds.
     // Methods nest a function/getter signature inside `method_declaration`.
@@ -416,6 +435,8 @@ mod langpack {
 (function_declaration signature: (function_signature name: (identifier) @name)) @def.function
 (method_declaration signature: (method_signature (function_signature name: (identifier) @name))) @def.method
 (method_declaration signature: (method_signature (getter_signature name: (identifier) @name))) @def.method
+(static_final_declaration name: (identifier) @name) @def.field
+(initialized_identifier name: (identifier) @name) @def.field
 "#;
     const JAVA_TAGS: &str = r#"
 (class_declaration name: (_) @name) @def.class
@@ -423,6 +444,8 @@ mod langpack {
 (enum_declaration name: (_) @name) @def.enum
 (method_declaration name: (_) @name) @def.function
 (constructor_declaration name: (_) @name) @def.function
+(field_declaration declarator: (variable_declarator name: (identifier) @name)) @def.field
+(enum_constant name: (identifier) @name) @def.variant
 "#;
     const RUBY_TAGS: &str = r#"
 (class name: (_) @name) @def.class
@@ -431,16 +454,23 @@ mod langpack {
 (singleton_method name: (_) @name) @def.def
 "#;
     // Swift's grammar models struct/enum/extension as `class_declaration` too.
+    // Properties are class-body-scoped (nesting) to skip function-local let/var.
     const SWIFT_TAGS: &str = r#"
 (class_declaration name: (_) @name) @def.class
 (protocol_declaration name: (_) @name) @def.interface
 (function_declaration name: (_) @name) @def.function
+(class_body (property_declaration name: (pattern bound_identifier: (simple_identifier) @name)) @def.field)
+(enum_entry name: (simple_identifier) @name) @def.variant
 "#;
-    // Kotlin models interface/object via class/object declarations.
+    // Kotlin models interface/object via class/object declarations. Properties are
+    // class-body / top-level scoped (nesting) to skip function-local val/var.
     const KOTLIN_TAGS: &str = r#"
 (class_declaration name: (_) @name) @def.class
 (object_declaration name: (_) @name) @def.class
 (function_declaration name: (_) @name) @def.function
+(class_body (property_declaration (variable_declaration (identifier) @name)) @def.field)
+(source_file (property_declaration (variable_declaration (identifier) @name)) @def.const)
+(enum_entry (identifier) @name) @def.variant
 "#;
     // C names are nested inside `function_declarator`; struct/enum/union/typedef
     // carry a name/declarator field.
@@ -450,6 +480,10 @@ mod langpack {
 (union_specifier name: (type_identifier) @name) @def.struct
 (enum_specifier name: (type_identifier) @name) @def.enum
 (type_definition declarator: (type_identifier) @name) @def.type
+(field_declaration declarator: (field_identifier) @name) @def.field
+(field_declaration declarator: (pointer_declarator declarator: (field_identifier) @name)) @def.field
+(enumerator name: (identifier) @name) @def.variant
+(preproc_def name: (identifier) @name) @def.const
 "#;
     const CPP_TAGS: &str = r#"
 (function_definition declarator: (function_declarator declarator: (identifier) @name)) @def.function
@@ -458,6 +492,9 @@ mod langpack {
 (struct_specifier name: (type_identifier) @name) @def.struct
 (enum_specifier name: (type_identifier) @name) @def.enum
 (namespace_definition name: (_) @name) @def.mod
+(field_declaration declarator: (field_identifier) @name) @def.field
+(field_declaration declarator: (pointer_declarator declarator: (field_identifier) @name)) @def.field
+(enumerator name: (identifier) @name) @def.variant
 "#;
     const CSHARP_TAGS: &str = r#"
 (class_declaration name: (_) @name) @def.class
@@ -467,6 +504,9 @@ mod langpack {
 (method_declaration name: (_) @name) @def.function
 (constructor_declaration name: (_) @name) @def.function
 (namespace_declaration name: (_) @name) @def.mod
+(property_declaration name: (identifier) @name) @def.field
+(field_declaration (variable_declaration (variable_declarator name: (identifier) @name))) @def.field
+(enum_member_declaration name: (identifier) @name) @def.variant
 "#;
     const PHP_TAGS: &str = r#"
 (class_declaration name: (_) @name) @def.class
@@ -475,6 +515,9 @@ mod langpack {
 (enum_declaration name: (_) @name) @def.enum
 (function_definition name: (_) @name) @def.function
 (method_declaration name: (_) @name) @def.function
+(property_declaration (property_element name: (variable_name (name) @name))) @def.field
+(const_declaration (const_element (name) @name)) @def.const
+(enum_case name: (name) @name) @def.variant
 "#;
 
     static RUST: LangPack = pack!(rust_lang, RUST_TAGS);
@@ -532,6 +575,8 @@ mod langpack {
             "interface" => "interface",
             "type" => "type",
             "const" => "const",
+            "field" => "field",
+            "variant" => "variant",
             _ => "symbol",
         }
     }
@@ -606,6 +651,192 @@ impl S {
             "items: {:?}",
             tree.items
         );
+    }
+
+    #[test]
+    fn dart_fields_and_consts_are_first_class_symbols() {
+        // SCRY-128: a class-level const/field must be its OWN small symbol so a
+        // symbol query lands on the declaration line, not the enclosing god-class.
+        let src = "\
+class Config {
+  static const int stardustValue = 2;
+  final String name;
+  int count = 0;
+  void doThing() {}
+}
+";
+        let tree = parse(src, Lang::Dart);
+        let field = tree
+            .items
+            .iter()
+            .find(|i| i.name.as_deref() == Some("stardustValue"))
+            .unwrap_or_else(|| panic!("stardustValue not indexed: {:?}", tree.items));
+        assert_eq!(field.kind, "field");
+        assert_eq!(
+            (field.start, field.end),
+            (2, 2),
+            "field span is the decl line"
+        );
+        // the other field-likes are present too
+        for n in ["name", "count"] {
+            assert!(
+                tree.items.iter().any(|i| i.name.as_deref() == Some(n)),
+                "{n} not indexed: {:?}",
+                tree.items
+            );
+        }
+        // the class and method still index (no regression).
+        assert!(tree.items.iter().any(|i| i.kind == "class"));
+        assert!(tree
+            .items
+            .iter()
+            .any(|i| i.name.as_deref() == Some("doThing")));
+    }
+
+    #[test]
+    fn members_are_first_class_symbols_across_languages() {
+        // SCRY-130: a class field / property / enum-member / top-level constant must
+        // be its OWN small symbol so a name lookup lands on the declaration, not the
+        // enclosing god-class. This ALSO guards against a malformed tags query: a
+        // bad query fails to compile, query() returns None, and parse() silently
+        // falls back to the heuristic scanner — which does NOT find members — so a
+        // missing member here means the query broke (a severe per-language regress).
+        // Each case: (lang, source, member-name, expected-kind).
+        let cases: &[(Lang, &str, &str, &str)] = &[
+            (
+                Lang::Rust,
+                "struct S { stardust: i32 }\n",
+                "stardust",
+                "field",
+            ),
+            (Lang::Rust, "enum E { Alpha, Beta }\n", "Alpha", "variant"),
+            (
+                Lang::Rust,
+                "const STARDUST: i32 = 2;\n",
+                "STARDUST",
+                "const",
+            ),
+            (
+                Lang::Python,
+                "class C:\n    STARDUST = 2\n",
+                "STARDUST",
+                "field",
+            ),
+            (Lang::Python, "STARDUST = 2\n", "STARDUST", "const"),
+            (
+                Lang::TypeScript,
+                "class C {\n  stardust: number = 2;\n}\n",
+                "stardust",
+                "field",
+            ),
+            (
+                Lang::TypeScript,
+                "enum E { Alpha, Beta }\n",
+                "Alpha",
+                "variant",
+            ),
+            (
+                Lang::TypeScript,
+                "export const STARDUST = 2;\n",
+                "STARDUST",
+                "const",
+            ),
+            (
+                Lang::JavaScript,
+                "class C {\n  stardust = 2;\n}\n",
+                "stardust",
+                "field",
+            ),
+            (
+                Lang::JavaScript,
+                "export const STARDUST = 2;\n",
+                "STARDUST",
+                "const",
+            ),
+            (
+                Lang::Go,
+                "type S struct {\n  Stardust int\n}\n",
+                "Stardust",
+                "field",
+            ),
+            (Lang::Go, "const Stardust = 2\n", "Stardust", "const"),
+            (
+                Lang::Java,
+                "class C {\n  private int stardust;\n}\n",
+                "stardust",
+                "field",
+            ),
+            (Lang::Java, "enum E { ALPHA, BETA }\n", "ALPHA", "variant"),
+            (
+                Lang::CSharp,
+                "class C {\n  public int Stardust { get; set; }\n}\n",
+                "Stardust",
+                "field",
+            ),
+            (Lang::CSharp, "enum E { Alpha, Beta }\n", "Alpha", "variant"),
+            (
+                Lang::Kotlin,
+                "class C {\n  val stardust = 2\n}\n",
+                "stardust",
+                "field",
+            ),
+            (
+                Lang::Kotlin,
+                "enum class E { ALPHA, BETA }\n",
+                "ALPHA",
+                "variant",
+            ),
+            (
+                Lang::Swift,
+                "class C {\n  let stardust = 2\n}\n",
+                "stardust",
+                "field",
+            ),
+            (
+                Lang::Php,
+                "<?php\nclass C {\n  public int $stardust = 2;\n}\n",
+                "stardust",
+                "field",
+            ),
+            (
+                Lang::Php,
+                "<?php\nenum E { case Alpha; }\n",
+                "Alpha",
+                "variant",
+            ),
+            (
+                Lang::C,
+                "struct S { int stardust; };\n",
+                "stardust",
+                "field",
+            ),
+            (Lang::C, "enum E { ALPHA, BETA };\n", "ALPHA", "variant"),
+            (
+                Lang::Cpp,
+                "class C { public: int stardust; };\n",
+                "stardust",
+                "field",
+            ),
+        ];
+        for (lang, src, member, kind) in cases {
+            let tree = parse(src, *lang);
+            let found = tree
+                .items
+                .iter()
+                .find(|i| i.name.as_deref() == Some(member));
+            match found {
+                Some(it) => assert_eq!(
+                    it.kind, *kind,
+                    "{lang:?}: `{member}` has wrong kind; items: {:?}",
+                    tree.items
+                ),
+                None => panic!(
+                    "{lang:?}: member `{member}` NOT indexed (tags query may have failed to \
+                     compile → heuristic fallback). items: {:?}",
+                    tree.items
+                ),
+            }
+        }
     }
 
     #[test]

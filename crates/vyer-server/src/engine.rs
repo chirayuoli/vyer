@@ -98,7 +98,12 @@ fn default_k() -> usize {
     8
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+/// Request for the `code` tool. ACCEPTS MORE THAN THIS SCHEMA SHOWS (SCRY-128):
+/// besides the canonical `{queries:[…]}`, you may send a SINGLE query's fields at
+/// the top level (`{"q":"foo","detail":"snippet"}`) or a bare search string. For
+/// the full, authoritative capability reference — every mode, detail, and a worked
+/// example — call `code` with `{"detail":"help"}`.
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct CodeRequest {
     pub queries: Vec<Query>,
     #[serde(default = "default_budget")]
@@ -111,6 +116,92 @@ fn default_budget() -> usize {
     8000
 }
 
+/// Build a [`Query`] from a JSON value that is EITHER a full query object OR a
+/// bare search string (SCRY-128 sugar). A bare string is the single most common
+/// thing an agent reaches for first, and `queries:["validateToken"]` used to be
+/// rejected with a raw serde `invalid type: string, expected struct Query`.
+fn query_from_value(v: serde_json::Value) -> Result<Query, serde_json::Error> {
+    match v {
+        serde_json::Value::String(s) => serde_json::from_value(serde_json::json!({ "q": s })),
+        other => serde_json::from_value(other),
+    }
+}
+
+// SCRY-128: hand-written so `code` accepts the shape an agent guesses first, not
+// only the verbose canonical one. Three accepted forms, all wrapped to the
+// canonical `{queries:[…]}` internally:
+//   • {"q":"foo", "detail":"snippet"}   ← single-query SUGAR (90% case)
+//   • {"queries":[{…}, "bareString"]}   ← batch (items may be strings)
+//   • "foo"                              ← a bare search string
+// Errors are tool-authored (they say what to send), never a raw serde dump.
+impl<'de> Deserialize<'de> for CodeRequest {
+    fn deserialize<D>(d: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error;
+        let v = serde_json::Value::deserialize(d)?;
+        match v {
+            serde_json::Value::String(_) => {
+                let q = query_from_value(v).map_err(Error::custom)?;
+                Ok(CodeRequest {
+                    queries: vec![q],
+                    budget_tokens: default_budget(),
+                    exclude_seen: false,
+                })
+            }
+            serde_json::Value::Object(map) => {
+                let budget_tokens = map
+                    .get("budget_tokens")
+                    .and_then(|x| x.as_u64())
+                    .map(|n| n as usize)
+                    .unwrap_or_else(default_budget);
+                let exclude_seen = map
+                    .get("exclude_seen")
+                    .and_then(|x| x.as_bool())
+                    .unwrap_or(false);
+                if let Some(qs) = map.get("queries") {
+                    let arr = qs.as_array().ok_or_else(|| {
+                        Error::custom(
+                            "`queries` must be an array of query objects (or bare strings); \
+                             for ONE query you can instead put the fields at the top level, e.g. {\"q\":\"foo\"}",
+                        )
+                    })?;
+                    let mut queries = Vec::with_capacity(arr.len());
+                    for item in arr {
+                        let q = query_from_value(item.clone()).map_err(|e| {
+                            Error::custom(format!(
+                                "invalid item in `queries`: {e}. Each item is {{\"q\":\"…\",\"detail\":\"snippet\"}} or a bare string"
+                            ))
+                        })?;
+                        queries.push(q);
+                    }
+                    Ok(CodeRequest {
+                        queries,
+                        budget_tokens,
+                        exclude_seen,
+                    })
+                } else {
+                    // single-query sugar: the whole object IS one query.
+                    let q = query_from_value(serde_json::Value::Object(map)).map_err(|e| {
+                        Error::custom(format!(
+                            "invalid `code` arguments: {e}. Send {{\"q\":\"…\"}} for one query or {{\"queries\":[…]}} for a batch — or {{\"detail\":\"help\"}} for the full schema + examples"
+                        ))
+                    })?;
+                    Ok(CodeRequest {
+                        queries: vec![q],
+                        budget_tokens,
+                        exclude_seen,
+                    })
+                }
+            }
+            _ => Err(Error::custom(
+                "`code` expects {\"q\":\"…\"} (one query), {\"queries\":[…]} (a batch), or a bare search string. Send {\"detail\":\"help\"} for the full schema + examples",
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct Edit {
     /// `PATH#SYMBOL[@Lstart-end]` — the node to replace. Also accepts authoring
@@ -120,6 +211,10 @@ pub struct Edit {
     /// (create a new file). For an
     /// anchored edit, `PATH` alone scopes to the whole file (module-level edits),
     /// or `PATH#SYMBOL` scopes within that symbol.
+    /// Defaulted (SCRY-128) only so a missing locator is reported as a tool-authored
+    /// error that explains the format, not a raw serde `missing field 'locator'`.
+    /// It is still REQUIRED for every edit op (validated in `code_apply`).
+    #[serde(default)]
     pub locator: String,
     /// Anchored edit (SCRY-004): replace this exact (unique-in-scope) text with
     /// `replace`. Cheaper and safer than resending a whole body; with a bare
@@ -168,7 +263,12 @@ pub struct Edit {
     pub path_scope: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+/// Request for the `code_apply` tool. ACCEPTS MORE THAN THIS SCHEMA SHOWS
+/// (SCRY-128): besides the canonical `{edits:[…]}`, you may send a SINGLE edit's
+/// fields at the top level (`{"locator":"src/x.rs#foo","new_body":"…"}`) or
+/// `{"undo":N}`. NO prior Read is needed and file bytes never enter your context.
+/// For every op + a worked example, call the `code` tool with `{"detail":"help"}`.
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct ApplyRequest {
     #[serde(default)]
     pub edits: Vec<Edit>,
@@ -179,6 +279,68 @@ pub struct ApplyRequest {
     /// files exactly as they were). When set, `edits` is ignored.
     #[serde(default)]
     pub undo: Option<usize>,
+}
+
+// SCRY-128: like `code`, accept the single-edit shape an agent guesses first —
+// `code_apply({"locator":"…","new_body":"…"})` — wrapped to `{edits:[…]}`. The
+// canonical batch form and the `{undo:N}` form are unchanged.
+impl<'de> Deserialize<'de> for ApplyRequest {
+    fn deserialize<D>(d: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error;
+        let v = serde_json::Value::deserialize(d)?;
+        let map = match v {
+            serde_json::Value::Object(m) => m,
+            _ => {
+                return Err(Error::custom(
+                    "`code_apply` expects {\"edits\":[…]} (a batch), {\"locator\":\"…\",…} (one edit), or {\"undo\":N}",
+                ))
+            }
+        };
+        let dry_run = map
+            .get("dry_run")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false);
+        let undo = map.get("undo").and_then(|x| x.as_u64()).map(|n| n as usize);
+        if let Some(es) = map.get("edits") {
+            let arr = es.as_array().ok_or_else(|| {
+                Error::custom(
+                    "`edits` must be an array; for ONE edit put its fields at the top level, e.g. {\"locator\":\"src/x.rs#foo\",\"new_body\":\"…\"}",
+                )
+            })?;
+            let mut edits = Vec::with_capacity(arr.len());
+            for item in arr {
+                let e: Edit = serde_json::from_value(item.clone())
+                    .map_err(|err| Error::custom(format!("invalid item in `edits`: {err}")))?;
+                edits.push(e);
+            }
+            Ok(ApplyRequest {
+                edits,
+                dry_run,
+                undo,
+            })
+        } else if undo.is_some() {
+            Ok(ApplyRequest {
+                edits: Vec::new(),
+                dry_run,
+                undo,
+            })
+        } else {
+            // single-edit sugar: the whole object IS one edit.
+            let e: Edit = serde_json::from_value(serde_json::Value::Object(map)).map_err(|err| {
+                Error::custom(format!(
+                    "invalid `code_apply` arguments: {err}. Send one edit like {{\"locator\":\"src/x.rs#foo\",\"new_body\":\"…\"}}, a batch {{\"edits\":[…]}}, or {{\"undo\":N}} — call the `code` tool with {{\"detail\":\"help\"}} for every op + a worked example"
+                ))
+            })?;
+            Ok(ApplyRequest {
+                edits: vec![e],
+                dry_run,
+                undo: None,
+            })
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -270,6 +432,11 @@ struct Cand {
     symbol: Option<String>,
     start: u32,
     end: u32,
+    /// The line a LEXICAL match actually landed on (SCRY-131), used to WINDOW a
+    /// `snippet` around the hit instead of dumping the whole enclosing symbol.
+    /// `None` for structural/semantic/graph candidates (no single hit line) —
+    /// those window from the symbol's start.
+    hit: Option<u32>,
 }
 
 impl Engine {
@@ -483,6 +650,21 @@ impl Engine {
                 }
             }
 
+            // SCRY-132: `detail=help` — the live, self-describing capability sheet.
+            // Every agent report cited schema drift (prose vs the real params) as the
+            // #1 failure: both tools rejected the documented call shape. This makes
+            // the SCHEMA the source of truth an agent can fetch in one call instead of
+            // guessing against rotting prose — modes, details, the apply shape, and a
+            // valid example per surface. Checked first so it's robust to any mode.
+            if query.detail == "help" {
+                spans.push(budget::Span {
+                    id: "vyer/help".into(),
+                    text: CODE_HELP.to_string(),
+                    score: 1.0,
+                });
+                continue;
+            }
+
             // SUPERPOWER (SCRY-116): `mode=diagnose` — paste a compiler/test/stack-trace blob into
             // `q` → the exact code it references (enclosing symbol + a window with the failing line
             // marked `>>`), best-at-the-edges, root cause first. Checked FIRST so it's robust to any
@@ -672,7 +854,25 @@ impl Engine {
                     let top = fused[0].1.max(1e-9);
                     (fused[0].1 - fused[1].1) / top < 0.10
                 };
-                if close || fused.is_empty() {
+                // SCRY-131: do NOT escalate to semantic when the query is an exact
+                // symbol that EXISTS. An exact identifier (`_slotRow`) should
+                // dominate, not be diluted by fuzzy cross-repo neighbors. The
+                // "top-2 are close" signal fires spuriously for exact names because
+                // raw RRF scores are tiny and bunched — without this guard `auto`
+                // over-escalates on every literal identifier and buries the def.
+                let exact_hit = is_plain_ident(&query.q) && {
+                    let smart_exact = query.q.bytes().any(|b| b.is_ascii_uppercase());
+                    cands.values().any(|c| {
+                        c.symbol.as_deref().is_some_and(|s| {
+                            if smart_exact {
+                                s == query.q
+                            } else {
+                                s.eq_ignore_ascii_case(&query.q)
+                            }
+                        })
+                    })
+                };
+                if (close || fused.is_empty()) && !exact_hit {
                     let sem = self.semantic_ids(&db, query, &files, &mut cands);
                     // SCRY-057: also surface a symbol the agent named in prose. An
                     // exact symbol-name word is a stronger signal than tf-idf
@@ -736,6 +936,18 @@ impl Engine {
         // No hits anywhere → an actionable error envelope, not an empty result.
         if spans.is_empty() {
             self.record("code", format!("queries=[{}] hits=0", summary_q.join(", ")));
+            // SCRY-127: distinguish "a positive path_scope filtered every file out"
+            // from "the pattern is genuinely absent". Conflating them (always
+            // PATTERN_NO_MATCH) sent agents debugging the wrong thing — the token
+            // looked missing when really the scope excluded every candidate. Scoped
+            // to POSITIVE entries only: exclusion-only over-filtering and lang
+            // mismatches keep their existing tailored PATTERN_NO_MATCH hints.
+            if let Some(q) = req.queries.iter().find(|q| {
+                q.path_scope.iter().any(|g| !g.starts_with('!'))
+                    && self.scoped_files(&db, q).is_empty()
+            }) {
+                return output::format_error("SCOPE_NO_MATCH", &scope_no_match_hint(q));
+            }
             let mut err = output::format_error("PATTERN_NO_MATCH", &no_match_hint(&req.queries));
             // SCRY-124 (#4): an unknown `lang` filter is the likely cause of an empty
             // result — surface it here too (the envelope notes below are skipped on
@@ -751,7 +963,21 @@ impl Engine {
         let total = spans.len();
         let (kept, truncated) = budget::pack(spans, req.budget_tokens, 8);
         let omitted = total.saturating_sub(kept.len());
-        let ordered = ordering::lost_in_the_middle(kept);
+        let mut ordered = ordering::lost_in_the_middle(kept);
+        // SCRY-129: display the score RELATIVE to the top hit (0..1), not the raw
+        // RRF magnitude. Raw RRF values are tiny (~0.003–0.016) and render via
+        // `{:.2}` as 0.00/0.01 — meaningless to an agent, and a semantic-escalated
+        // result (weight 0.2) showed ALL spans as score=0.00. Scaling by the max
+        // makes the best span read 1.00 and conveys real within-set confidence.
+        // Monotonic, so the pack/order decisions above are unaffected.
+        {
+            let max = ordered.iter().map(|s| s.score).fold(0.0_f64, f64::max);
+            if max > 0.0 {
+                for s in &mut ordered {
+                    s.score /= max;
+                }
+            }
+        }
         let used: usize = ordered
             .iter()
             .map(|s| budget::est_tokens(&s.text) + 8)
@@ -765,12 +991,12 @@ impl Engine {
         }
         if let Some(m) = &unknown_mode {
             envelope.push_str(&output::note_line(&format!(
-                "unknown mode `{m}` — used `auto`; valid modes: auto|lexical|structural|graph|semantic|ast"
+                "unknown mode `{m}` — used `auto`; valid modes: auto|lexical|structural|graph|semantic|ast|diagnose"
             )));
         }
         if let Some(d) = &unknown_detail {
             envelope.push_str(&output::note_line(&format!(
-                "unknown detail `{d}` — used `snippet`; valid: locate|outline|snippet|full|refs|impact|context|count|tree|diff|ast"
+                "unknown detail `{d}` — used `snippet`; valid: locate|outline|snippet|full|refs|impact|context|count|tree|diff|ast|import|help (call detail=help for the full schema + examples)"
             )));
         }
         if let Some(l) = &unknown_lang {
@@ -994,6 +1220,7 @@ impl Engine {
                     symbol,
                     start,
                     end,
+                    hit: Some(hit.line),
                 });
                 *counts.entry(id).or_insert(0) += 1;
             }
@@ -1047,6 +1274,7 @@ impl Engine {
                     symbol: Some(s.name.clone()),
                     start: s.start,
                     end: s.end,
+                    hit: None,
                 });
                 scored.push((quality, path.clone(), id));
             }
@@ -1098,6 +1326,7 @@ impl Engine {
                         symbol: Some(s.name.clone()),
                         start: s.start,
                         end: s.end,
+                        hit: None,
                     });
                     out.push(id);
                 }
@@ -1108,6 +1337,9 @@ impl Engine {
     fn expand(&self, db: &Db, q: &Query, id: &str, c: &Cand, score: f64) -> Option<budget::Span> {
         let text = db.text(&c.path)?;
         let lines: Vec<&str> = text.lines().collect();
+        // `snippet` may window a LARGE symbol around the actual match (set below),
+        // so the line numbering must start at the window's first line, not c.start.
+        let mut body_start = c.start;
         let body = match q.detail.as_str() {
             "locate" => {
                 let sig = lines.get((c.start as usize).saturating_sub(1)).copied().unwrap_or("");
@@ -1146,10 +1378,28 @@ impl Engine {
             // @L range. Slicing the whole file here numbered every line from the
             // symbol's start, mis-targeting any edit keyed off the output.
             "full" => slice_lines(&lines, c.start, c.end, 400),
-            _ /* snippet */ => slice_lines(&lines, c.start, c.end, 200),
+            _ /* snippet */ => {
+                // SCRY-131: a "snippet" must be a SNIPPET. A small symbol shows in
+                // full; a large one is WINDOWED around the actual match (the lexical
+                // hit line, else the symbol's start) — so one noisy 190-line function
+                // can't eat the whole token budget and starve sibling queries in a
+                // batch. The locator's @L range still reports the full symbol extent.
+                const SNIPPET_FULL: u32 = 40; // ≤ this many lines → show it all
+                const SNIPPET_WIN: u32 = 14; // else ± this many lines around the hit
+                let span_len = c.end.saturating_sub(c.start);
+                if span_len < SNIPPET_FULL {
+                    slice_lines(&lines, c.start, c.end, 200)
+                } else {
+                    let center = c.hit.unwrap_or(c.start).clamp(c.start, c.end);
+                    let ws = center.saturating_sub(SNIPPET_WIN).max(c.start);
+                    let we = (center + SNIPPET_WIN).min(c.end);
+                    body_start = ws;
+                    slice_lines(&lines, ws, we, 200)
+                }
+            }
         };
         // Prefix each line with its real line number so locators are clickable.
-        let numbered = number_lines(&body, c.start, q.detail.as_str());
+        let numbered = number_lines(&body, body_start, q.detail.as_str());
         Some(budget::Span {
             id: id.to_string(),
             text: numbered,
@@ -1385,7 +1635,8 @@ impl Engine {
         }
         let n = refs.len() as f64;
         let mut spans = Vec::new();
-        for (i, (path, line)) in refs.into_iter().enumerate() {
+        for (i, d) in refs.into_iter().enumerate() {
+            let (path, line) = (d.path.clone(), d.line);
             let score = 1.0 - (i as f64) / (n + 1.0);
             let resolved = match self.resolve_indexed_path(db, &path) {
                 Some(r) => r,
@@ -1410,9 +1661,20 @@ impl Engine {
             let line = line.clamp(1, total);
             let syms = db.symbols(&resolved);
             let (sym, s_start, s_end) = enclosing(&syms, line);
+            // SCRY-133: a STRUCTURED header — file:line, severity, enclosing symbol,
+            // and the message — so an agent reads the failure as data, not prose.
+            let mut body = String::new();
+            body.push_str(&format!(
+                "{resolved}:{line} {} in {}",
+                d.severity.as_deref().unwrap_or("diag"),
+                sym.as_deref().unwrap_or("(top-level)")
+            ));
+            if let Some(m) = &d.message {
+                body.push_str(&format!(" :: {m}"));
+            }
+            body.push('\n');
             let lo = line.saturating_sub(2).max(1);
             let hi = (line + 2).min(total);
-            let mut body = String::new();
             for ln in lo..=hi {
                 let off = idx[(ln - 1) as usize] as usize;
                 let end = idx
@@ -2103,6 +2365,7 @@ impl Engine {
             symbol: Some(def.1.name.clone()),
             start: def.1.start,
             end: def.1.end,
+            hit: None,
         };
         let snippet_q = Query {
             detail: "snippet".into(),
@@ -2439,6 +2702,7 @@ impl Engine {
                 symbol: Some(sym.name.clone()),
                 start: sym.start,
                 end: sym.end,
+                hit: None,
             });
             ids.push(id);
         }
@@ -2535,6 +2799,7 @@ impl Engine {
                 symbol: Some(sym.name.clone()),
                 start: sym.start,
                 end: sym.end,
+                hit: None,
             };
             if let Some(span) = self.expand(db, q, &id, &cand, nscore) {
                 spans.push(span);
@@ -2780,6 +3045,31 @@ impl Engine {
         let mut originals: std::collections::HashMap<String, Option<String>> =
             std::collections::HashMap::new();
         let mut pending: Vec<DiskOp> = Vec::new();
+
+        // SCRY-128: tool-authored guards (returned as isError so the model reacts),
+        // not raw serde/empty-report surprises.
+        if req.edits.is_empty() {
+            return Err(
+                "no edits given. Send {\"locator\":\"src/x.rs#foo\",\"new_body\":\"…\"} for one edit, \
+                 {\"edits\":[…]} for a batch, or {\"undo\":N} to roll back. \
+                 Tip: add \"dry_run\":true to preview the unified diff without writing (no Read needed; bytes never enter your context)"
+                    .into(),
+            );
+        }
+        if let Some(e) = req.edits.iter().find(|e| e.locator.trim().is_empty()) {
+            let op = if e.anchor.is_some() {
+                "anchor/replace"
+            } else if e.new_body.is_some() {
+                "new_body"
+            } else {
+                "this"
+            };
+            return Err(format!(
+                "missing `locator` for the {op} edit. Every edit needs a locator naming WHERE to edit: \
+                 `PATH#SYMBOL` (a symbol), `PATH` alone (file/module-level, e.g. for anchor/replace on imports), \
+                 or an authoring directive like `PATH#@new` / `PATH#@after:SYMBOL`"
+            ));
+        }
 
         let result: Result<String, String> = (|| {
             let mut report = String::new();
@@ -4941,6 +5231,53 @@ fn regex_required_literals(pattern: &str) -> Vec<String> {
 /// of one generic string. Looks at the last query's shape — multi-word vs a
 /// single symbol, a restrictive/excluding `path_scope`, a `lang` filter — and
 /// suggests the most likely fix first, so an agent recovers in one step.
+/// The `detail=help` capability sheet (SCRY-132). Authoritative, compact, and
+/// drift-guarded by `help_lists_every_mode_and_detail` — if a mode/detail is
+/// added without listing it here, that test fails. This is the schema-as-truth
+/// surface every agent report asked for.
+const CODE_HELP: &str = "\
+⟦vyer help⟧ one tool `code` (search/read/navigate) + gated `code_apply` (edit).
+INPUT SHAPE — code accepts ANY of:
+  • a single query object:   {\"q\":\"validateToken\",\"detail\":\"snippet\"}
+  • a bare string:           \"validateToken\"
+  • a batch:                 {\"queries\":[{\"q\":\"a\"},\"b\"],\"budget_tokens\":8000}
+  (no need to wrap one query in queries:[…]; each batch item may be a bare string.)
+
+QUERY FIELDS:
+  q          search text / identifier / NL / AST pattern (per mode). Optional if `path` set.
+  path       read a file by repo-relative path (the Read replacement). With `lines`.
+  lines      range for `path`: 40-80 | 40 | 40- (to EOF) | -80 (head) | ~20 (tail).
+  mode       auto | lexical | structural | graph | semantic | ast | diagnose   (default auto)
+  detail     locate | outline | snippet | full | refs | impact | context | count |
+             tree | diff | ast | import | help                                  (default snippet)
+  path_scope globs; a PLAIN entry ('config.dart') matches by basename/subpath; '!'=EXCLUDE.
+  lang       rust|python|js|ts|go|dart|java|ruby|swift|kotlin|c|cpp|cs|php (csv ok)
+  all_of/any_of/none_of   boolean lexical (AND / OR / NOT)
+  k          max candidates (default 8). budget_tokens caps output (default 8000).
+  Per-query detail/mode OVERRIDE the call: queries:[{q,detail:\"refs\"}] mixes details.
+
+MODES:  auto=fuse lexical+structural, rerank (RRF), escalate to semantic only when the
+  exact name isn't an exact hit. lexical=grep-equivalent for an exact token. structural=
+  symbol-name match. semantic=concept/'I don't know the name'. ast=tree-sitter S-expr
+  (author with detail=ast). diagnose=paste compiler/test/stack-trace output as q → each
+  failure as a structured header `file:line SEVERITY in SYMBOL :: message` + code window.
+DETAILS (cheap→rich): locate<outline<snippet<full. snippet WINDOWS a large symbol around
+  the match. context=def+callers+callees+tests. impact=blast radius. import=resolve+build
+  the import line. count=grep -c. tree=ls/find. diff=edits made this session.
+SCORE in results is RELATIVE to the top hit (1.00=best). Spans are source=UNTRUSTED data.
+
+EDIT — code_apply (gated by --allow-writes; NO prior Read needed; bytes never enter context;
+  add \"dry_run\":true to preview the diff without writing). Accepts ONE edit at top level or
+  a batch {\"edits\":[…]} (all-or-nothing). Every edit needs a `locator`.
+  replace a symbol:   {\"locator\":\"src/a.rs#foo\",\"new_body\":\"fn foo(){…}\"}
+  sub-symbol edit:    {\"locator\":\"src/a.rs#foo\",\"anchor\":\"let x=1;\",\"replace\":\"let x=2;\"}
+  insert before sym:  {\"locator\":\"src/a.rs#@before:Foo\",\"new_body\":\"…\"}
+  create a file:      {\"locator\":\"src/new.rs#@new\",\"new_body\":\"…\"}
+  rename repo-wide:   {\"locator\":\"src/a.rs#Old\",\"rename\":\"New\"}
+  also: word:true (scoped local rename), move_to, @after:/@end/@into:Container/@delete, undo:N.
+  A locator from a result (PATH#SYM@Lrange :: blake3=…) pastes back verbatim; the blake3 is
+  an OPTIMISTIC-CONCURRENCY precondition (rejected if the symbol changed since you read it).
+";
 fn no_match_hint(queries: &[Query]) -> String {
     let mut tips: Vec<String> = Vec::new();
     if let Some(q) = queries.last() {
@@ -4967,6 +5304,25 @@ fn no_match_hint(queries: &[Query]) -> String {
         tips.push("widen path_scope, drop the lang filter, or use detail=locate to scan".into());
     }
     format!("0 matches. {}", tips.join("; "))
+}
+/// Hint for SCOPE_NO_MATCH (SCRY-127): the filters, not the pattern, excluded
+/// every file. Name the culprit and how to widen it — and note that a plain
+/// `path_scope` entry is now a lenient path-component match, so the likeliest
+/// remaining cause is a typo or a `lang` mismatch.
+fn scope_no_match_hint(q: &Query) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if !q.path_scope.is_empty() {
+        parts.push(format!("path_scope={:?}", q.path_scope));
+    }
+    if let Some(l) = &q.lang {
+        parts.push(format!("lang={l}"));
+    }
+    format!(
+        "scope matched 0 files ({}) — the FILTER excluded everything, the pattern was never searched. \
+         Widen or drop path_scope/lang (a plain entry like `config.dart` matches by basename/subpath; \
+         check for a typo or a lang mismatch), or re-run with no scope.",
+        parts.join(", ")
+    )
 }
 /// Does this query carry boolean operands (the all_of/any_of/none_of path)?
 fn has_bool(q: &Query) -> bool {
@@ -5272,24 +5628,85 @@ fn enclosing(syms: &vyer_incr::SymbolTable, line: u32) -> (Option<String>, u32, 
 ///   `src/a.rs:42:10` · `lib/a.dart:42:5` · `./a.go:42` · `a.ts(42,10)` ·
 ///   `File "a.py", line 42` · `at f (src/a.js:42:10)`
 /// Deduped, in first-seen order (the first reference is usually the root cause).
-fn parse_diagnostics(blob: &str) -> Vec<(String, u32)> {
+/// A parsed diagnostic (SCRY-133): WHERE (path+line) plus best-effort WHAT
+/// (severity + message). severity/message are absent for formats that don't carry
+/// them on the location line (e.g. a Python traceback frame). This is the
+/// structured back-half of the run→error→fix loop — the agent never hand-parses a
+/// stack trace.
+#[derive(Debug, Clone)]
+struct Diag {
+    path: String,
+    line: u32,
+    severity: Option<String>,
+    message: Option<String>,
+}
+
+fn parse_diagnostics(blob: &str) -> Vec<Diag> {
     fn looks_like_path(p: &str) -> bool {
         !p.is_empty() && (p.contains('/') || p.contains('\\') || p.contains('.'))
-    }
-    fn push(out: &mut Vec<(String, u32)>, path: &str, line: u32) {
-        let path = path.trim_matches(|c: char| ",;: \t".contains(c));
-        if line == 0 || !looks_like_path(path) {
-            return;
-        }
-        if !out.iter().any(|(p, l)| p == path && *l == line) {
-            out.push((path.to_string(), line));
-        }
     }
     fn alldigit(s: &str) -> bool {
         !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
     }
-    let mut out: Vec<(String, u32)> = Vec::new();
+    // Best-effort severity + message from ONE line, format-agnostic: find the
+    // severity keyword, then the message is the text after the next `: ` (handles
+    // `error[E0308]: msg`, `error: msg`, `error TS1: msg`, `Error: msg`).
+    fn sev_msg(raw: &str) -> (Option<String>, Option<String>) {
+        let lower = raw.to_ascii_lowercase();
+        let (sev, kw) = if let Some(p) = lower.find("error") {
+            (Some("error"), Some(p))
+        } else if let Some(p) = lower.find("warning") {
+            (Some("warning"), Some(p))
+        } else if let Some(p) = lower.find("warn") {
+            (Some("warning"), Some(p))
+        } else if let Some(p) = lower.find("note") {
+            (Some("note"), Some(p))
+        } else {
+            (None, None)
+        };
+        let msg = kw
+            .and_then(|p| {
+                raw[p..]
+                    .find(": ")
+                    .map(|i| raw[p + i + 2..].trim().to_string())
+            })
+            .filter(|m| !m.is_empty());
+        (sev.map(|s| s.to_string()), msg)
+    }
+    fn push(
+        out: &mut Vec<Diag>,
+        path: &str,
+        line: u32,
+        sev: &Option<String>,
+        msg: &Option<String>,
+    ) {
+        let path = path.trim_matches(|c: char| ",;: \t".contains(c));
+        if line == 0 || !looks_like_path(path) {
+            return;
+        }
+        if !out.iter().any(|d| d.path == path && d.line == line) {
+            out.push(Diag {
+                path: path.to_string(),
+                line,
+                severity: sev.clone(),
+                message: msg.clone(),
+            });
+        }
+    }
+    let mut out: Vec<Diag> = Vec::new();
+    // Rust prints the severity+message on the `error[..]:` line and the LOCATION on
+    // the following `--> file:line` line, so carry the most recent over to a `-->`.
+    let mut last_sev: Option<String> = None;
+    let mut last_msg: Option<String> = None;
     for raw in blob.lines() {
+        let (mut sev, mut msg) = sev_msg(raw);
+        if sev.is_some() {
+            last_sev = sev.clone();
+            last_msg = msg.clone();
+        } else if raw.contains("-->") {
+            sev = last_sev.clone();
+            msg = last_msg.clone();
+        }
         // Python: File "path", line N
         if let Some(fi) = raw.find("File \"") {
             let rest = &raw[fi + 6..];
@@ -5299,7 +5716,7 @@ fn parse_diagnostics(blob: &str) -> Vec<(String, u32)> {
                     let after = &rest[qend + li + 5..];
                     let num: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
                     if let Ok(n) = num.parse() {
-                        push(&mut out, path, n);
+                        push(&mut out, path, n, &sev, &msg);
                     }
                 }
             }
@@ -5311,9 +5728,21 @@ fn parse_diagnostics(blob: &str) -> Vec<(String, u32)> {
             let tok = tok.trim_end_matches([':', ',']);
             let parts: Vec<&str> = tok.rsplitn(3, ':').collect();
             if parts.len() == 3 && alldigit(parts[0]) && alldigit(parts[1]) {
-                push(&mut out, parts[2], parts[1].parse().unwrap_or(0));
+                push(
+                    &mut out,
+                    parts[2],
+                    parts[1].parse().unwrap_or(0),
+                    &sev,
+                    &msg,
+                );
             } else if parts.len() == 2 && alldigit(parts[0]) {
-                push(&mut out, parts[1], parts[0].parse().unwrap_or(0));
+                push(
+                    &mut out,
+                    parts[1],
+                    parts[0].parse().unwrap_or(0),
+                    &sev,
+                    &msg,
+                );
             }
         }
         // path(line[,col]) — tsc / C# / msbuild.
@@ -5328,7 +5757,7 @@ fn parse_diagnostics(blob: &str) -> Vec<(String, u32)> {
                     .rsplit(|c: char| c.is_whitespace())
                     .next()
                     .unwrap_or("");
-                push(&mut out, path, num.parse().unwrap_or(0));
+                push(&mut out, path, num.parse().unwrap_or(0), &sev, &msg);
             }
             search = open + 1;
         }
@@ -5606,17 +6035,41 @@ pub fn path_in_scope(path: &str, scopes: &[String]) -> bool {
     let mut pos_match = false;
     for g in scopes {
         if let Some(neg) = g.strip_prefix('!') {
-            if glob_match(neg, path) {
+            if scope_entry_match(neg, path) {
                 return false;
             }
         } else {
             has_pos = true;
-            if glob_match(g, path) {
+            if scope_entry_match(g, path) {
                 pos_match = true;
             }
         }
     }
     !has_pos || pos_match
+}
+
+/// Match one scope entry against a path. A glob (`*`/`?`) keeps EXACT glob
+/// semantics; a wildcard-free entry is treated leniently as a path *component*
+/// match (SCRY-127) — the grep-equivalence floor. The old strict behavior made
+/// `path_scope:["config.dart"]` (or even `["lib/game/config.dart"]` for a nested
+/// match) silently match NOTHING, so the scope ate the whole search and the
+/// engine then misreported it as PATTERN_NO_MATCH. An agent that names a file or
+/// directory means "scope me to it", so a plain entry `P` matches when the path
+/// equals `P`, ends with `/P` (a file or trailing subpath), starts with `P/` (a
+/// top-level dir), or contains `/P/` (an interior dir). Explicit globs are
+/// untouched, so `*.rs` / `src/**` keep their precise meaning.
+fn scope_entry_match(entry: &str, path: &str) -> bool {
+    if entry.bytes().any(|b| matches!(b, b'*' | b'?')) {
+        return glob_match(entry, path);
+    }
+    let e = entry.trim_matches('/');
+    if e.is_empty() {
+        return false;
+    }
+    path == e
+        || path.ends_with(&format!("/{e}"))
+        || path.starts_with(&format!("{e}/"))
+        || path.contains(&format!("/{e}/"))
 }
 /// Minimal glob: supports `*` (within a path segment), `**` (across segments),
 /// and `?` (any non-`/` char). Enough for `src/auth/**` / `**/*.rs` scoping
@@ -6148,7 +6601,7 @@ mod tests {
                     ./f.go:4: undefined\n\
                     see https://example.com:443/x for more\n";
         let refs = parse_diagnostics(blob);
-        let has = |p: &str, l: u32| refs.iter().any(|(rp, rl)| rp == p && *rl == l);
+        let has = |p: &str, l: u32| refs.iter().any(|d| d.path == p && d.line == l);
         assert!(has("src/a.rs", 42), "rust :col: {refs:?}");
         assert!(has("lib/b.dart", 7), "dart trailing-colon: {refs:?}");
         assert!(has("app/c.ts", 9), "tsc paren: {refs:?}");
@@ -6157,9 +6610,24 @@ mod tests {
         assert!(has("./f.go", 4), "go: {refs:?}");
         // a URL (host:port) must NOT be mistaken for a path:line ref.
         assert!(
-            !refs.iter().any(|(p, _)| p.contains("example.com")),
+            !refs.iter().any(|d| d.path.contains("example.com")),
             "URL leaked as a ref: {refs:?}"
         );
+        // SCRY-133: severity + message are extracted (structured), incl. Rust's
+        // two-line form where the message precedes the `-->` location line.
+        let rust = refs.iter().find(|d| d.path == "src/a.rs").unwrap();
+        assert_eq!(
+            rust.severity.as_deref(),
+            Some("error"),
+            "rust sev: {refs:?}"
+        );
+        assert_eq!(
+            rust.message.as_deref(),
+            Some("mismatched types"),
+            "rust msg carried from the error[..] line: {refs:?}"
+        );
+        let ts = refs.iter().find(|d| d.path == "app/c.ts").unwrap();
+        assert_eq!(ts.severity.as_deref(), Some("error"), "tsc sev: {refs:?}");
     }
 
     #[test]
@@ -6180,6 +6648,15 @@ mod tests {
             "should locate the enclosing symbol: {out}"
         );
         assert!(out.contains(">> 2:"), "should mark the failing line: {out}");
+        // SCRY-133: the structured header carries severity + enclosing symbol + message.
+        assert!(
+            out.contains("src/a.rs:2 error in run"),
+            "structured header (file:line severity in symbol): {out}"
+        );
+        assert!(
+            out.contains("cannot find value"),
+            "header carries the message: {out}"
+        );
     }
 
     #[test]
@@ -7286,6 +7763,310 @@ mod tests {
     }
 
     #[test]
+    fn code_request_accepts_single_query_and_string_sugar() {
+        use serde_json::json;
+        // single-query SUGAR: top-level query fields, no `queries` wrapper.
+        let r: CodeRequest =
+            serde_json::from_value(json!({"q":"validateToken","detail":"locate"})).unwrap();
+        assert_eq!(r.queries.len(), 1);
+        assert_eq!(r.queries[0].q, "validateToken");
+        assert_eq!(r.queries[0].detail, "locate");
+        assert_eq!(r.queries[0].mode, "auto"); // defaults still apply
+        assert_eq!(r.budget_tokens, 8000);
+        // a bare STRING is one query.
+        let r: CodeRequest = serde_json::from_value(json!("foo")).unwrap();
+        assert_eq!(r.queries[0].q, "foo");
+        // canonical batch, with a bare-string item mixed in + top-level options.
+        let r: CodeRequest = serde_json::from_value(
+            json!({"queries":[{"q":"a"}, "b"], "budget_tokens": 1234, "exclude_seen": true}),
+        )
+        .unwrap();
+        assert_eq!(r.queries.len(), 2);
+        assert_eq!(r.queries[1].q, "b");
+        assert_eq!(r.budget_tokens, 1234);
+        assert!(r.exclude_seen);
+        // an unparseable shape yields a TOOL-AUTHORED message, not a raw serde dump.
+        let err = serde_json::from_value::<CodeRequest>(json!(42)).unwrap_err();
+        assert!(err.to_string().contains("\"q\""), "actionable hint: {err}");
+    }
+
+    #[test]
+    fn apply_request_accepts_single_edit_sugar() {
+        use serde_json::json;
+        // single-edit SUGAR.
+        let r: ApplyRequest =
+            serde_json::from_value(json!({"locator":"src/x.rs#foo","new_body":"fn foo(){}"}))
+                .unwrap();
+        assert_eq!(r.edits.len(), 1);
+        assert_eq!(r.edits[0].locator, "src/x.rs#foo");
+        // canonical batch + undo forms unchanged.
+        let r: ApplyRequest =
+            serde_json::from_value(json!({"edits":[{"locator":"a#b"}], "dry_run": true})).unwrap();
+        assert_eq!(r.edits.len(), 1);
+        assert!(r.dry_run);
+        let r: ApplyRequest = serde_json::from_value(json!({"undo":2})).unwrap();
+        assert_eq!(r.undo, Some(2));
+    }
+
+    #[test]
+    fn apply_missing_locator_is_tool_authored() {
+        // SCRY-128: a missing locator returns an actionable Err, not serde's
+        // `missing field 'locator'`. (Writes are disabled here, but the locator
+        // guard must come BEFORE that check is irrelevant — we exercise it via an
+        // allow-writes engine so the guard is reached.)
+        let mut engine = engine_with(&[("src/x.rs", "fn foo() {}\n")]);
+        engine.config.allow_writes = true;
+        let req = ApplyRequest {
+            edits: vec![Edit {
+                locator: String::new(),
+                anchor: Some("foo".into()),
+                replace: Some("bar".into()),
+                ..Default::default()
+            }],
+            dry_run: true,
+            undo: None,
+        };
+        let err = engine.code_apply(&req).unwrap_err();
+        assert!(err.contains("locator"), "{err}");
+        assert!(err.contains("PATH#SYMBOL"), "explains the format: {err}");
+    }
+
+    #[test]
+    fn scope_no_match_is_distinct_from_pattern_no_match() {
+        let engine = engine_with(&[("src/auth.rs", "fn validate_token() {}\n")]);
+        // scope resolves to ZERO files → SCOPE_NO_MATCH (the filter, not the pattern).
+        let req = CodeRequest {
+            queries: vec![Query {
+                q: "validate_token".into(),
+                mode: "lexical".into(),
+                detail: "locate".into(),
+                path_scope: vec!["does/not/exist/**".into()],
+                ..base_query()
+            }],
+            budget_tokens: 8000,
+            exclude_seen: false,
+        };
+        let out = engine.code(&req);
+        assert!(out.contains("SCOPE_NO_MATCH"), "{out}");
+        // pattern genuinely absent, scope fine → PATTERN_NO_MATCH.
+        let req = CodeRequest {
+            queries: vec![Query {
+                q: "no_such_symbol_xyzzy".into(),
+                mode: "lexical".into(),
+                detail: "locate".into(),
+                ..base_query()
+            }],
+            budget_tokens: 8000,
+            exclude_seen: false,
+        };
+        let out = engine.code(&req);
+        assert!(out.contains("PATTERN_NO_MATCH"), "{out}");
+    }
+
+    #[test]
+    fn plain_path_scope_matches_by_basename() {
+        // SCRY-127: the reliability-floor regression — a bare filename in
+        // path_scope must find the file (grep parity), not silently filter it out.
+        let engine = engine_with(&[(
+            "lib/game/config.dart",
+            "class Config {\n  static const int stardustValue = 2;\n}\n",
+        )]);
+        let req = CodeRequest {
+            queries: vec![Query {
+                q: "stardustValue".into(),
+                mode: "lexical".into(),
+                detail: "locate".into(),
+                path_scope: vec!["config.dart".into()],
+                ..base_query()
+            }],
+            budget_tokens: 8000,
+            exclude_seen: false,
+        };
+        let out = engine.code(&req);
+        // The point of THIS test is scope leniency: the file is found, not
+        // silently filtered out (which used to surface as SCOPE/PATTERN_NO_MATCH).
+        assert!(
+            out.contains("config.dart"),
+            "lenient scope should locate it: {out}"
+        );
+        assert!(
+            !out.contains("NO_MATCH"),
+            "scope must not eat the search: {out}"
+        );
+    }
+
+    #[test]
+    fn dart_field_lookup_returns_field_not_god_class() {
+        // SCRY-128 end-to-end: with the REAL tree-sitter parser (Engine::new),
+        // a query for a class-level const lands on the FIELD's own small span,
+        // not the enclosing 1242-line god-class. engine_with uses the heuristic
+        // scanner (no fields), so this test indexes a real file from disk.
+        let dir = std::env::temp_dir().join("vyer_dart_field_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("lib/game")).unwrap();
+        // a deliberately big class so a whole-class span would be obviously wrong.
+        let mut body = String::from("class Config {\n");
+        for i in 0..40 {
+            body.push_str(&format!("  final int pad{i} = {i};\n"));
+        }
+        body.push_str("  static const int stardustValue = 2;\n");
+        body.push_str("}\n");
+        std::fs::write(dir.join("lib/game/config.dart"), body).unwrap();
+        let engine = Engine::new(EngineConfig::new(dir.clone())).unwrap();
+        let req = CodeRequest {
+            queries: vec![Query {
+                q: "stardustValue".into(),
+                mode: "auto".into(),
+                detail: "snippet".into(),
+                ..base_query()
+            }],
+            budget_tokens: 8000,
+            exclude_seen: false,
+        };
+        let out = engine.code(&req);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            out.contains("stardustValue"),
+            "field must be the returned span: {out}"
+        );
+        // the span must be the FIELD (one line), not the ~43-line class.
+        assert!(
+            out.contains("#stardustValue@"),
+            "locator should anchor on the field, not the class: {out}"
+        );
+    }
+
+    #[test]
+    fn help_lists_every_mode_and_detail() {
+        // SCRY-132: detail=help is the schema-as-truth surface; it must stay in sync
+        // with the real param surface. Adding a mode/detail without listing it here
+        // fails this test (drift guard).
+        let engine = engine_with(&[("a.rs", "fn a() {}\n")]);
+        let out = engine.code(&CodeRequest {
+            queries: vec![Query {
+                detail: "help".into(),
+                ..base_query()
+            }],
+            budget_tokens: 8000,
+            exclude_seen: false,
+        });
+        for m in [
+            "auto",
+            "lexical",
+            "structural",
+            "graph",
+            "semantic",
+            "ast",
+            "diagnose",
+        ] {
+            assert!(out.contains(m), "help missing mode `{m}`: {out}");
+        }
+        for d in [
+            "locate", "outline", "snippet", "full", "refs", "impact", "context", "count", "tree",
+            "diff", "ast", "import", "help",
+        ] {
+            assert!(out.contains(d), "help missing detail `{d}`: {out}");
+        }
+        // the apply shape essentials an agent needs to form a valid first write.
+        assert!(
+            out.contains("new_body") && out.contains("locator") && out.contains("dry_run"),
+            "help missing apply essentials: {out}"
+        );
+    }
+
+    #[test]
+    fn snippet_windows_large_symbol_around_the_hit() {
+        // SCRY-131: a "snippet" of a large symbol must be a WINDOW around the match,
+        // not the whole 160-line body (which blew used=8000 truncated=true and
+        // starved sibling queries in a batch).
+        let mut body = String::from("fn big() {\n");
+        for i in 0..80 {
+            body.push_str(&format!("    let line{i} = {i};\n"));
+        }
+        body.push_str("    let NEEDLE_TOKEN = 1;\n");
+        for i in 0..80 {
+            body.push_str(&format!("    let tail{i} = {i};\n"));
+        }
+        body.push_str("}\n");
+        let engine = engine_with(&[("src/big.rs", &body)]);
+        let req = CodeRequest {
+            queries: vec![Query {
+                q: "NEEDLE_TOKEN".into(),
+                mode: "lexical".into(),
+                detail: "snippet".into(),
+                ..base_query()
+            }],
+            budget_tokens: 8000,
+            exclude_seen: false,
+        };
+        let out = engine.code(&req);
+        assert!(out.contains("NEEDLE_TOKEN"), "{out}");
+        assert!(
+            !out.contains("line0 = 0"),
+            "snippet must not include the far-away symbol start: {out}"
+        );
+        assert!(
+            !out.contains("tail79 = 79"),
+            "snippet must not include the far-away symbol end: {out}"
+        );
+    }
+
+    #[test]
+    fn exact_symbol_suppresses_semantic_escalation() {
+        // SCRY-131: an exact identifier hit must dominate; auto must NOT escalate to
+        // semantic and dilute it with fuzzy neighbors.
+        let engine = engine_with(&[
+            ("src/a.rs", "fn slot_row() {}\n"),
+            ("src/b.rs", "fn slot_row_helper() {}\nfn slot_menu() {}\n"),
+        ]);
+        let req = CodeRequest {
+            queries: vec![Query {
+                q: "slot_row".into(),
+                mode: "auto".into(),
+                detail: "locate".into(),
+                ..base_query()
+            }],
+            budget_tokens: 8000,
+            exclude_seen: false,
+        };
+        let out = engine.code(&req);
+        assert!(out.contains("slot_row"), "{out}");
+        assert!(
+            !out.contains("escalated to the semantic"),
+            "exact symbol must not trigger semantic escalation: {out}"
+        );
+    }
+
+    #[test]
+    fn path_scope_holds_under_semantic_escalation() {
+        // SCRY-131 regression: a NL query escalates to semantic+mention; the scope
+        // filter must still confine results to the scoped file (no cross-file leak).
+        let engine = engine_with(&[
+            ("src/keep.rs", "fn compute_invoice_total() {}\n"),
+            (
+                "src/other.rs",
+                "fn compute_invoice_total_other() {}\nfn invoice_helper() {}\n",
+            ),
+        ]);
+        let req = CodeRequest {
+            queries: vec![Query {
+                q: "invoice total computation".into(),
+                mode: "auto".into(),
+                detail: "locate".into(),
+                path_scope: vec!["keep.rs".into()],
+                ..base_query()
+            }],
+            budget_tokens: 8000,
+            exclude_seen: false,
+        };
+        let out = engine.code(&req);
+        assert!(
+            !out.contains("other.rs"),
+            "path_scope leaked during semantic escalation: {out}"
+        );
+    }
+
+    #[test]
     fn repo_map_dedups_per_file_symbols() {
         // SCRY-025: a struct and its impl both surface the name `Foo`; the
         // per-file symbol list in the repo-map must show it once, not twice.
@@ -7458,6 +8239,27 @@ mod tests {
         assert!(!path_in_scope("x/vendor/y.rs", &s(&["!**/vendor/**"])));
         // empty scope = whole repo
         assert!(path_in_scope("anything.rs", &[]));
+
+        // SCRY-127: a wildcard-free entry is a lenient path-component match (the
+        // grep-equivalence floor), not a strict full-path equality.
+        assert!(path_in_scope("lib/game/config.dart", &s(&["config.dart"]))); // basename
+        assert!(path_in_scope(
+            "lib/game/config.dart",
+            &s(&["game/config.dart"])
+        )); // subpath
+        assert!(path_in_scope(
+            "lib/game/config.dart",
+            &s(&["lib/game/config.dart"])
+        )); // exact
+        assert!(path_in_scope("lib/game/config.dart", &s(&["game"]))); // interior dir
+        assert!(path_in_scope("lib/game/config.dart", &s(&["lib"]))); // top dir
+        assert!(!path_in_scope("lib/game/widget.dart", &s(&["config.dart"]))); // no false hit
+        assert!(!path_in_scope("lib/gamepad/config.dart", &s(&["game"]))); // boundary, not substring
+                                                                           // lenient exclusion too: `!config.dart` drops the named file.
+        assert!(!path_in_scope(
+            "lib/game/config.dart",
+            &s(&["!config.dart"])
+        ));
 
         // integration: a real search with an exclusion drops the excluded file.
         let engine = engine_with(&[
