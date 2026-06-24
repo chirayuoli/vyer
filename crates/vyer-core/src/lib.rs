@@ -228,10 +228,22 @@ pub mod sandbox {
             if lname == "mcp.json" || lname == ".mcp.json" {
                 return true;
             }
+            // SCRY-136: agent-host CREDENTIAL / config files. vyer has no code path
+            // that touches these (no network, no keychain, no auth — apply only
+            // writes relative paths under root, rejecting absolute paths + `..`
+            // escapes), so this matters ONLY if an operator roots vyer at/above
+            // $HOME. Defense-in-depth so an apply can never corrupt agent auth (the
+            // "it logged me out" class) or settings-driven hooks. `.claude/` itself
+            // is covered by the directory-prefix block below.
+            if matches!(lname.as_str(), ".claude.json" | ".credentials.json") {
+                return true;
+            }
         }
         // directory-prefix blocks
         let s = rel.to_string_lossy().replace('\\', "/");
-        let blocked_prefixes = [".git/", ".github/", ".hooks/"];
+        // `.claude/` holds agent credentials + settings.json (which can define hooks
+        // → an RCE-adjacent surface, same rationale as mcp.json).
+        let blocked_prefixes = [".git/", ".github/", ".hooks/", ".claude/"];
         if blocked_prefixes
             .iter()
             .any(|p| s.starts_with(p) || s.contains(&format!("/{}", p)))
@@ -560,6 +572,24 @@ mod tests {
             sandbox::validate_write(root, "/abs/path"),
             Err(sandbox::DenyReason::Absolute)
         );
+        // SCRY-136: agent-host credential/config files are blocked (matters if an
+        // operator roots vyer at/above $HOME — defense-in-depth against the
+        // "an edit logged me out" class).
+        for cred in [
+            ".claude.json",
+            ".claude/.credentials.json",
+            ".claude/settings.json",
+            "sub/.claude/settings.json",
+            ".credentials.json",
+        ] {
+            assert_eq!(
+                sandbox::validate_write(root, cred),
+                Err(sandbox::DenyReason::Blocked),
+                "must block credential/config path: {cred}"
+            );
+        }
+        // a normal source file under a 'claude'-named dir (not '.claude') is fine.
+        assert!(sandbox::validate_write(root, "claude/notes.md").is_ok());
     }
 
     #[test]

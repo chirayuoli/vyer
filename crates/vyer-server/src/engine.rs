@@ -2988,30 +2988,61 @@ impl Engine {
                 Some(format!("verify({label})=ok\n"))
             }
             Ok(o) => {
-                // Surface the first error-ish line from stderr (then stdout).
                 let err = String::from_utf8_lossy(&o.stderr);
                 let out = String::from_utf8_lossy(&o.stdout);
-                let pick = err
-                    .lines()
-                    .chain(out.lines())
-                    .find(|l| {
-                        let t = l.to_ascii_lowercase();
-                        t.contains("error") || t.contains("failed")
-                    })
-                    .or_else(|| {
-                        err.lines()
-                            .chain(out.lines())
-                            .find(|l| !l.trim().is_empty())
-                    })
-                    .unwrap_or("(no output)")
-                    .trim();
                 self.record("verify", format!("{label} FAILED"));
+                // SCRY-135: pipe the build/test output through the STRUCTURED
+                // diagnostics parser (the back-half of mode=diagnose) so the agent
+                // reads "what I broke" as data — file:line [severity] :: message —
+                // not a single hand-picked error line. This is the post-edit
+                // diagnostics report, using the operator-gated verify_cmd that
+                // already runs (no new execution surface; Rules §1/§3 intact).
+                let combined = format!("{err}\n{out}");
+                let diags = parse_diagnostics(&combined);
+                let mut report = String::new();
+                if diags.is_empty() {
+                    // No file:line refs parsed — fall back to the first error-ish line.
+                    let pick = err
+                        .lines()
+                        .chain(out.lines())
+                        .find(|l| {
+                            let t = l.to_ascii_lowercase();
+                            t.contains("error") || t.contains("failed")
+                        })
+                        .or_else(|| {
+                            err.lines()
+                                .chain(out.lines())
+                                .find(|l| !l.trim().is_empty())
+                        })
+                        .unwrap_or("(no output)")
+                        .trim();
+                    report.push_str(&format!("verify({label})=FAILED: {pick}\n"));
+                } else {
+                    let shown = diags.len().min(10);
+                    report.push_str(&format!(
+                        "verify({label})=FAILED: {} diagnostic(s) (showing {shown})\n",
+                        diags.len()
+                    ));
+                    for d in diags.iter().take(10) {
+                        report.push_str(&format!(
+                            "  {}:{} {} :: {}\n",
+                            d.path,
+                            d.line,
+                            d.severity.as_deref().unwrap_or("diag"),
+                            d.message.as_deref().unwrap_or("(see output)")
+                        ));
+                    }
+                    report.push_str(
+                        "  → paste the build output into `code` mode=diagnose for enclosing symbols + code windows\n",
+                    );
+                }
                 // SCRY-055: the write already committed (verify runs post-apply and
                 // does not roll back, so multi-step refactors aren't blocked). Tell
                 // the agent so it can `undo:1` if this edit caused the failure.
-                Some(format!(
-                    "verify({label})=FAILED: {pick}\n  note: the edit IS written; if it caused this, code_apply undo:1 to revert\n"
-                ))
+                report.push_str(
+                    "  note: the edit IS written; if it caused this, code_apply undo:1 to revert\n",
+                );
+                Some(report)
             }
             Err(e) => Some(format!(
                 "verify({label})=ERROR: could not run `{label}` ({e})\n"
