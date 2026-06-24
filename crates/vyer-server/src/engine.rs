@@ -955,6 +955,49 @@ impl Engine {
             }) {
                 return output::format_error("SCOPE_NO_MATCH", &scope_no_match_hint(q));
             }
+            // SCRY-137: fuzzy "did you mean" recovery. AI agents mistype identifiers;
+            // rather than dead-end on PATTERN_NO_MATCH and burn a round-trip, return
+            // the nearest symbols by bounded edit distance so the agent self-corrects
+            // in ONE call. Only here (the rare no-match path), only for a plain
+            // identifier — exact search stays exact (the grep floor is untouched).
+            if let Some(q) = req
+                .queries
+                .iter()
+                .rfind(|q| is_plain_ident(&q.q) && q.q.trim().len() >= 3)
+            {
+                let near = self.fuzzy_symbol_matches(&db, q);
+                if !near.is_empty() {
+                    let mut fz = Vec::new();
+                    for (f, s, dist) in near.into_iter().take(q.k.max(1)) {
+                        let text = db.text(&f).unwrap_or_else(|| std::sync::Arc::from(""));
+                        let id = make_id(&f, Some(&s.name), s.start, s.end, &text);
+                        fz.push(budget::Span {
+                            id,
+                            text: format!(
+                                "L{}-{} [{}] {}  (fuzzy: edit-distance {dist} from `{}`)",
+                                s.start,
+                                s.end,
+                                s.kind,
+                                s.signature.trim(),
+                                q.q
+                            ),
+                            score: 1.0 - (dist as f64) / 10.0,
+                        });
+                    }
+                    let ordered = ordering::lost_in_the_middle(fz);
+                    let used: usize = ordered
+                        .iter()
+                        .map(|s| budget::est_tokens(&s.text) + 8)
+                        .sum();
+                    let mut env =
+                        output::format_result(&ordered, req.budget_tokens, used, false, 0);
+                    env.push_str(&output::note_line(&format!(
+                        "no EXACT match for `{}` — these are the nearest symbols by edit distance (did you mean one of them?)",
+                        q.q
+                    )));
+                    return env;
+                }
+            }
             let mut err = output::format_error("PATTERN_NO_MATCH", &no_match_hint(&req.queries));
             // SCRY-124 (#4): an unknown `lang` filter is the likely cause of an empty
             // result — surface it here too (the envelope notes below are skipped on
@@ -2031,6 +2074,41 @@ impl Engine {
                 out.push((f.clone(), hit.line));
             }
         }
+        out
+    }
+
+    /// SCRY-137: symbols whose name is within a small edit distance of `q.q` — the
+    /// "did you mean" recovery for a mistyped identifier. Scoped + length-pruned +
+    /// bounded Levenshtein (early-exit), so it's cheap even though it only runs on
+    /// the no-match path. Threshold scales with name length (3-7→1, 8-11→2, 12+→3).
+    fn fuzzy_symbol_matches(&self, db: &Db, q: &Query) -> Vec<(String, vyer_incr::Symbol, u32)> {
+        let needle = q.q.trim().to_ascii_lowercase();
+        let nlen = needle.chars().count();
+        if nlen < 3 {
+            return Vec::new();
+        }
+        let max_dist = (nlen / 4).clamp(1, 3) as u32;
+        let mut out: Vec<(String, vyer_incr::Symbol, u32)> = Vec::new();
+        for f in self.scoped_files(db, q) {
+            for s in &db.symbols(&f).symbols {
+                let slen = s.name.chars().count();
+                if slen.abs_diff(nlen) > max_dist as usize {
+                    continue; // length prune before the (bounded) distance compute
+                }
+                if let Some(d) = levenshtein_within(&needle, &s.name.to_ascii_lowercase(), max_dist)
+                {
+                    if d > 0 {
+                        out.push((f.clone(), s.clone(), d));
+                    }
+                }
+            }
+        }
+        out.sort_by(|a, b| {
+            a.2.cmp(&b.2)
+                .then(a.1.name.len().cmp(&b.1.name.len()))
+                .then(a.0.cmp(&b.0))
+        });
+        out.dedup_by(|a, b| a.0 == b.0 && a.1.name == b.1.name && a.1.start == b.1.start);
         out
     }
 
@@ -5442,6 +5520,34 @@ fn scope_no_match_hint(q: &Query) -> String {
         parts.join(", ")
     )
 }
+/// Bounded Levenshtein edit distance (SCRY-137): returns the distance if it is
+/// `<= max`, else `None`. Early-exits when a whole DP row exceeds `max`, so a
+/// far-apart pair costs O(max·len), not O(len²). Used only for typo recovery.
+fn levenshtein_within(a: &str, b: &str, max: u32) -> Option<u32> {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let (la, lb) = (a.len(), b.len());
+    if la.abs_diff(lb) > max as usize {
+        return None;
+    }
+    let mut prev: Vec<u32> = (0..=lb as u32).collect();
+    let mut cur = vec![0u32; lb + 1];
+    for i in 1..=la {
+        cur[0] = i as u32;
+        let mut row_min = cur[0];
+        for j in 1..=lb {
+            let cost = u32::from(a[i - 1] != b[j - 1]);
+            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
+            row_min = row_min.min(cur[j]);
+        }
+        if row_min > max {
+            return None; // every alignment through this row already exceeds max
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    let d = prev[lb];
+    (d <= max).then_some(d)
+}
 /// Does this query carry boolean operands (the all_of/any_of/none_of path)?
 fn has_bool(q: &Query) -> bool {
     !q.all_of.is_empty() || !q.any_of.is_empty() || !q.none_of.is_empty()
@@ -7947,6 +8053,44 @@ mod tests {
         let err = engine.code_apply(&req).unwrap_err();
         assert!(err.contains("locator"), "{err}");
         assert!(err.contains("PATH#SYMBOL"), "explains the format: {err}");
+    }
+
+    #[test]
+    fn fuzzy_recovery_suggests_near_miss_on_typo() {
+        // SCRY-137: a mistyped identifier returns the nearest symbol instead of a
+        // dead-end PATTERN_NO_MATCH — recover in one call.
+        let engine = engine_with(&[("src/a.rs", "fn validate_token() {}\nfn parse_header() {}\n")]);
+        let req = CodeRequest {
+            queries: vec![Query {
+                q: "validate_tokn".into(), // typo: missing 'e'
+                mode: "lexical".into(),
+                detail: "locate".into(),
+                ..base_query()
+            }],
+            budget_tokens: 8000,
+            exclude_seen: false,
+        };
+        let out = engine.code(&req);
+        assert!(
+            out.contains("validate_token") && out.contains("fuzzy"),
+            "should recover the near-miss symbol: {out}"
+        );
+        assert!(
+            !out.contains("PATTERN_NO_MATCH"),
+            "typo should recover, not dead-end: {out}"
+        );
+        // a genuinely-absent identifier (far from everything) still cleanly no-matches.
+        let req2 = CodeRequest {
+            queries: vec![Query {
+                q: "zzqqxx_nothing".into(),
+                mode: "lexical".into(),
+                detail: "locate".into(),
+                ..base_query()
+            }],
+            budget_tokens: 8000,
+            exclude_seen: false,
+        };
+        assert!(engine.code(&req2).contains("PATTERN_NO_MATCH"));
     }
 
     #[test]
