@@ -17,6 +17,7 @@ pub mod http;
 pub mod jsonrpc;
 pub mod lexical;
 pub mod mcp;
+pub mod semantic;
 pub mod watch;
 
 pub use engine::{ApplyRequest, CodeRequest, Engine, EngineConfig, Query};

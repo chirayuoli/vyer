@@ -384,6 +384,11 @@ pub struct EngineConfig {
     /// Gate for `code_run` (distinct effect class from writes). Off by default:
     /// the agent cannot execute anything unless the operator passed `--allow-run`.
     pub allow_run: bool,
+    /// SCRY-144 (LSP sidecar Phase 1): operator opt-in for the semantic provider.
+    /// Off by default; today only the seam exists (see `crate::semantic` +
+    /// `docs/design-lsp-sidecar.md`), so this currently just reports intent in
+    /// `vyer://status`. Phase 2 wires a real language server behind this flag.
+    pub allow_lsp: bool,
 }
 
 impl EngineConfig {
@@ -396,6 +401,7 @@ impl EngineConfig {
             verify_cmd: None,
             run_tasks: std::collections::BTreeMap::new(),
             allow_run: false,
+            allow_lsp: false,
         }
     }
 }
@@ -4519,9 +4525,21 @@ impl Engine {
                 names.join(", ")
             )
         };
+        // SCRY-144: honest semantic-tier line (LSP sidecar Phase 1). Today the seam
+        // exists but no language server is wired, so the tier is the built-in
+        // lexical/tree-sitter approximation; `--allow-lsp` reports operator intent.
+        let lsp_line = if self.config.allow_lsp {
+            "lsp=requested (Phase 2 wires a language server; graph still partial/approx)"
+                .to_string()
+        } else {
+            format!(
+                "lsp=off (graph tier={})",
+                crate::semantic::Tier::Partial.label()
+            )
+        };
         let db = self.db.lock().unwrap();
         format!(
-            "\u{27E6}vyer/status v1\u{27E7}\nroot={}\nindexed_files={}\nrevision={}\nwrites={}\nparser=tree-sitter\nlexical=ripgrep-libs\ngraph=partial(approx)\nsemantic=lexical-subword(tf-idf)\nast=tree-sitter-query\ncode.modes=auto|lexical|structural|graph|semantic|ast|diagnose\ncode.detail=locate|outline|snippet|full|refs|impact|context|count|tree|diff|ast|import|help\ncode.filters=path_scope(globs,!exclude)|lang(csv)|all_of/any_of/none_of\napply.ops=new_body|anchor/replace(+word=scoped-local-rename)|rename|move_to|@after/@before/@into/@end/@new|@delete|run|undo\nverify={}\n{}\n{}\n",
+            "\u{27E6}vyer/status v1\u{27E7}\nroot={}\nindexed_files={}\nrevision={}\nwrites={}\nparser=tree-sitter\nlexical=ripgrep-libs\ngraph=partial(approx)\nsemantic=lexical-subword(tf-idf)\nast=tree-sitter-query\ncode.modes=auto|lexical|structural|graph|semantic|ast|diagnose\ncode.detail=locate|outline|snippet|full|refs|impact|context|count|tree|diff|ast|import|help\ncode.filters=path_scope(globs,!exclude)|lang(csv)|all_of/any_of/none_of\napply.ops=new_body|anchor/replace(+word=scoped-local-rename)|rename|move_to|@after/@before/@into/@end/@new|@delete|run|undo\nverify={}\n{}\n{}\n{}\n",
             self.config.root.display(),
             db.files().len(),
             db.revision(),
@@ -4532,6 +4550,7 @@ impl Engine {
             },
             run_line,
             skipped_line,
+            lsp_line,
         )
     }
 
