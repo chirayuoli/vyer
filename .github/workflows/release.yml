@@ -43,7 +43,7 @@ jobs:
           - target: x86_64-pc-windows-msvc
             os: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Builds `--bin vyer` for the target (cross-compiling where needed), packages it
       # as vyer-<tag>-<target>.(tar.gz|zip), emits a .sha256, and uploads to the Release.
       - uses: taiki-e/upload-rust-binary-action@v1
